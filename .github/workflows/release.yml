@@ -1,0 +1,49 @@
+name: release
+
+# Publishes to npm (OIDC Trusted Publishing + provenance) and creates a GitHub
+# Release when a v* tag is pushed. No NPM_TOKEN secret — auth is via OIDC.
+#
+# One-time setup (the FIRST publish cannot use OIDC — npm requires the package to
+# exist before a Trusted Publisher can be configured):
+#   1. Publish the initial version locally:  npm publish --access public
+#   2. On npmjs.com → the package → Settings → Trusted Publisher → GitHub Actions:
+#      repository "diegomarino/opencode-lmstudio-warm", workflow "release.yml".
+#   3. From then on, `git tag vX.Y.Z && git push --follow-tags` publishes via OIDC.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the GitHub Release
+  id-token: write # OIDC trusted publishing + provenance attestation
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+      - name: Install dev dependencies
+        run: bun install
+      - name: Verify (typecheck + unit tests + shellcheck)
+        run: bun run check
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24 # bundles npm 11.x
+          registry-url: "https://registry.npmjs.org"
+      - name: Ensure npm supports trusted publishing (>= 11.5.1)
+        run: npm install -g npm@latest
+      - name: Publish to npm (OIDC trusted publishing + provenance)
+        run: npm publish --provenance --access public
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk "/^## \[${version}\]/{f=1;next} /^## \[/{f=0} f" CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then echo "Release ${GITHUB_REF_NAME}" > RELEASE_NOTES.md; fi
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file RELEASE_NOTES.md

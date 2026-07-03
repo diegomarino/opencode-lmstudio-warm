@@ -1,0 +1,16 @@
+{
+  "providers": ["lmstudio"],
+  "failMode": "hybrid",
+  "eager": true,
+  "reconcileDuplicates": true,
+  "launchAppFallback": true,
+  "verifyCacheMs": 30000,
+  "retryCooldownMs": 60000,
+  "loadTimeoutMs": 900000,
+  "serverStartTimeoutMs": 90000,
+  "lockWaitTimeoutMs": 1200000,
+  "perModel": {
+    "your-main-model-key": { "parallel": 6 },
+    "your-small-model-key": { "parallel": 4 }
+  }
+}

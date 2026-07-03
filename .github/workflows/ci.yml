@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Install dev dependencies
+        run: bun install
+      - name: Type-check the plugin
+        run: bun run typecheck
+      - name: Run unit tests
+        run: bun run test
+      - name: Lint verify.sh
+        run: shellcheck --severity=warning test/e2e/verify.sh

@@ -1,17 +1,17 @@
-## [0.1.1](https://github.com/diegomarino/opencode-lmstudio-warm/compare/v0.1.0...v0.1.1) (2026-07-04)
-
 # Changelog
 
-All notable changes to this project are documented here.
+All notable changes are documented here. From v0.1.1 onward, entries are
+generated automatically by [semantic-release](https://semver.org) from
+[Conventional Commits](https://www.conventionalcommits.org). While the version
+is `0.x`, a MINOR bump may include breaking changes (SemVer 0.x rule).
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-While the version is `0.x`, a MINOR bump may include breaking changes (per the
-SemVer 0.x rule); such changes are called out explicitly below.
+## [0.1.1](https://github.com/diegomarino/opencode-lmstudio-warm/compare/v0.1.0...v0.1.1) (2026-07-04)
 
-## [Unreleased]
+### Bug Fixes
 
-## [0.1.0] - 2026-07-03
+- avoid redundant eager warm when `model` and `small_model` are identical ([0f16e8f](https://github.com/diegomarino/opencode-lmstudio-warm/commit/0f16e8f))
+
+## 0.1.0 - 2026-07-04
 
 Initial public release.
 
@@ -44,6 +44,3 @@ Initial public release.
   lock immediately when its holder pid is dead (or the pid file is absent past a
   grace window), the release is synchronous, and a `process.on("exit")` handler
   is a last-resort cleanup. Verified 9/9 against a live LM Studio fleet.
-
-[Unreleased]: https://github.com/diegomarino/opencode-lmstudio-warm/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/diegomarino/opencode-lmstudio-warm/releases/tag/v0.1.0

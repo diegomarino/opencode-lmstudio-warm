@@ -1,5 +1,7 @@
 # Changelog
 
+## [0.1.2](https://github.com/diegomarino/opencode-lmstudio-warm/compare/v0.1.1...v0.1.2) (2026-07-04)
+
 All notable changes are documented here. From v0.1.1 onward, entries are
 generated automatically by [semantic-release](https://semver.org) from
 [Conventional Commits](https://www.conventionalcommits.org). While the version

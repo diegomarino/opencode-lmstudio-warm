@@ -1,6 +1,6 @@
 {
   "name": "opencode-lmstudio-warm",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Deterministic LM Studio model pre-warm gate for opencode — loads and keeps the target model resident before every request, healing cold starts and mid-session TTL evictions.",
   "type": "module",
   "main": "./src/index.ts",

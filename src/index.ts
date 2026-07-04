@@ -520,9 +520,12 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
     // chat.params gate below remains the deterministic barrier.
     config: async (cfg: any) => {
       if (!opts.eager) return
+      const warmed = new Set<string>()
       for (const ref of [cfg?.model, cfg?.small_model]) {
         const parsed = parseModelRef(ref)
         if (!parsed || !opts.providers.includes(parsed.providerID)) continue
+        if (warmed.has(parsed.key)) continue // model === small_model ⇒ warm the key once
+        warmed.add(parsed.key)
         const configured = cfg?.provider?.[parsed.providerID]?.options?.baseURL
         const baseURL = typeof configured === "string" && configured.startsWith("http") ? configured : opts.baseURL
         log(`eager warm queued for ${parsed.key}`)

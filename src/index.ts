@@ -145,17 +145,49 @@ const OK: WarmResult = { ok: true, confirmed: false, reason: "" }
 // No per-process state — the plugin closure below composes these with the live
 // caches, child processes, and lock directory.
 
-/** Merge config in precedence order: DEFAULTS < file options < plugin options.
- *  Also maps the legacy `failClosed` boolean onto `failMode` when the newer
- *  key isn't set. */
-export function resolveOptions(
-  fileOpts: Partial<WarmOptions>,
-  pluginOpts?: (Partial<WarmOptions> & { failClosed?: boolean }) | null,
-): WarmOptions {
-  const raw = { ...fileOpts, ...(pluginOpts ?? {}) }
-  // Legacy boolean from earlier revisions of this plugin.
-  if (raw.failClosed !== undefined && raw.failMode === undefined) raw.failMode = raw.failClosed ? "closed" : "open"
-  return { ...DEFAULTS, ...raw }
+/** Merge config in precedence order: DEFAULTS < file options < plugin options. */
+export function resolveOptions(fileOpts: Partial<WarmOptions>, pluginOpts?: Partial<WarmOptions> | null): WarmOptions {
+  return { ...DEFAULTS, ...fileOpts, ...(pluginOpts ?? {}) }
+}
+
+/** Keys in a raw options object that the plugin does not know. Surfaced as
+ *  warnings at startup — a typo'd key would otherwise be silently ignored. */
+export function unknownOptionKeys(raw: Record<string, unknown>): string[] {
+  return Object.keys(raw).filter((k) => !(k in DEFAULTS))
+}
+
+const NUMERIC_KEYS = [
+  "ttlSeconds",
+  "parallel",
+  "contextLength",
+  "verifyCacheMs",
+  "retryCooldownMs",
+  "loadTimeoutMs",
+  "serverStartTimeoutMs",
+  "lockWaitTimeoutMs",
+] as const
+const BOOLEAN_KEYS = ["reconcileDuplicates", "launchAppFallback", "eager"] as const
+const STRING_KEYS = ["lmsPath", "baseURL", "logFile", "lockDir"] as const
+
+/** Repair invalid option VALUES back to their defaults, collecting one
+ *  warning per repair. Notably an unrecognized failMode falls back to
+ *  "hybrid" (the default): the exact-match checks downstream would otherwise
+ *  make a typo silently behave like "open", the least safe mode. */
+export function sanitizeOptions(o: WarmOptions): { opts: WarmOptions; warnings: string[] } {
+  const warnings: string[] = []
+  const out: WarmOptions = { ...o }
+  const fix = (key: keyof WarmOptions, why: string) => {
+    warnings.push(`${key} ${why} — using default ${JSON.stringify(DEFAULTS[key])}`)
+    ;(out as Record<string, unknown>)[key] = DEFAULTS[key]
+  }
+  if (!["open", "closed", "hybrid"].includes(out.failMode)) fix("failMode", `"${out.failMode}" is not open|closed|hybrid`)
+  if (!Array.isArray(out.providers) || out.providers.length === 0 || out.providers.some((p) => typeof p !== "string"))
+    fix("providers", "must be a non-empty string array")
+  for (const k of NUMERIC_KEYS) if (typeof out[k] !== "number" || !Number.isFinite(out[k]) || out[k] < 0) fix(k, "must be a non-negative number")
+  for (const k of BOOLEAN_KEYS) if (typeof out[k] !== "boolean") fix(k, "must be a boolean")
+  for (const k of STRING_KEYS) if (typeof out[k] !== "string" || out[k] === "") fix(k, "must be a non-empty string")
+  if (out.perModel === null || typeof out.perModel !== "object" || Array.isArray(out.perModel)) fix("perModel", "must be an object")
+  return { opts: out, warnings }
 }
 
 /** opencode addresses models by the UNSUFFIXED key; LM Studio routes the API
@@ -166,6 +198,26 @@ export function resolveOptions(
  *  needed for correctness. */
 export function addressable(instances: LmsInstance[], key: string): boolean {
   return instances.some((i) => i.identifier === key)
+}
+
+/** Classify `lms ps` output for a key. "unknown" (ps output unavailable) is a
+ *  first-class state on purpose: it is AMBIGUOUS, never "absent" — loading
+ *  blind onto a possibly-resident key is how duplicate instances are made,
+ *  and a failed post-load probe must not be reported as a confirmed load
+ *  failure (that would negative-cache a model that may well be loaded). */
+export type PsCheck =
+  | { state: "unknown" }
+  | { state: "addressable" }
+  | { state: "absent" }
+  | { state: "duplicates"; dups: LmsInstance[]; busy: boolean }
+
+export function classifyPs(instances: LmsInstance[] | null, key: string): PsCheck {
+  if (instances === null) return { state: "unknown" }
+  if (addressable(instances, key)) return { state: "addressable" }
+  const dups = instances.filter((i) => i.modelKey === key)
+  if (dups.length === 0) return { state: "absent" }
+  const busy = dups.some((i) => i.status === "generating" || (i.queued ?? 0) > 0)
+  return { state: "duplicates", dups, busy }
 }
 
 /** Split an opencode model ref ("provider/key…") on the FIRST slash, so a key
@@ -202,11 +254,14 @@ export function pidAlive(pid: number): boolean {
   }
 }
 
-/** Parse a lock pid-file's contents to a pid, or null if absent/blank/garbage. */
+/** Parse a lock pid-file's contents to a pid, or null if absent/blank/garbage
+ *  or non-positive. Non-positive values are rejected because `kill(-1, 0)`
+ *  probes ALL processes (always "alive") — a corrupted pid file must not make
+ *  the lock unbreakable until the staleness backstop. */
 export function parseLockPid(content: string | null): number | null {
   if (content == null) return null
   const n = Number.parseInt(content.trim(), 10)
-  return Number.isFinite(n) ? n : null
+  return Number.isFinite(n) && n > 0 ? n : null
 }
 
 /** Given a warm outcome and the configured failMode, should opencode's request
@@ -218,16 +273,23 @@ export function shouldFailRequest(failMode: WarmOptions["failMode"], result: War
 }
 
 export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
-  const opts = resolveOptions(
-    loadFileOptions(),
-    pluginOptions as (Partial<WarmOptions> & { failClosed?: boolean }) | null,
-  )
+  const fileOpts = loadFileOptions()
+  const plugOpts = (pluginOptions ?? {}) as Partial<WarmOptions>
+  const { opts, warnings: configWarnings } = sanitizeOptions(resolveOptions(fileOpts, plugOpts))
+  for (const k of unknownOptionKeys(fileOpts as Record<string, unknown>))
+    configWarnings.push(`unknown option "${k}" in lmstudio-warm.json`)
+  for (const k of unknownOptionKeys(plugOpts as Record<string, unknown>))
+    configWarnings.push(`unknown option "${k}" in plugin options`)
 
   // ---- state (per opencode process) ----
-  const verifiedAt = new Map<string, number>() // model key -> last confirmed-addressable timestamp
+  // Warm caches are keyed by `${baseURL}::${modelKey}` — residency and failure
+  // are facts about one server+model pair, not about a model key in the
+  // abstract (two gated providers may serve the same key).
+  const verifiedAt = new Map<string, number>() // last confirmed-addressable timestamp
   const failedAt = new Map<string, { at: number; reason: string }>() // negative cache
   const inflight = new Map<string, Promise<WarmResult>>()
-  let serverVerifiedAt = 0
+  const serverVerifiedAt = new Map<string, number>() // baseURL -> last confirmed-listening
+  const serverFailedAt = new Map<string, number>() // baseURL -> last failed bring-up
   // True only while THIS process holds the mkdir lock. Used by the exit handler
   // to release a lock that a fire-and-forget eager warm may still be holding
   // when the process tears down (otherwise the async finally never runs).
@@ -237,30 +299,56 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
     fs.mkdirSync(path.dirname(opts.logFile), { recursive: true })
   } catch {}
 
+  // Rotate the log once it outgrows ~5 MB (one previous generation kept at
+  // .old) so long-lived fleet hosts cannot grow it unbounded.
+  try {
+    if (fs.statSync(opts.logFile).size > 5 * 1024 * 1024) fs.renameSync(opts.logFile, `${opts.logFile}.old`)
+  } catch {}
+
   function log(msg: string) {
     try {
       fs.appendFileSync(opts.logFile, `${new Date().toISOString()} [pid ${process.pid}] ${msg}\n`)
     } catch {}
   }
 
-  // Last-resort synchronous lock release. A one-shot `opencode run` can exit
-  // while a background eager warm still holds the lock; process.on("exit") runs
-  // sync only, so rmSync is the tool. Guard by the pid file so we never delete a
-  // lock another process legitimately re-acquired in the meantime (TOCTOU), and
-  // never throw from the handler. SIGKILL is uncatchable — the dead-holder
-  // liveness check in acquireLock is the backstop for that.
-  process.once("exit", () => {
-    if (!holdingLock) return
+  const loggedOnce = new Set<string>()
+  function logOnce(msg: string) {
+    if (loggedOnce.has(msg)) return
+    loggedOnce.add(msg)
+    log(msg)
+  }
+
+  for (const w of configWarnings) log(`config warning: ${w}`)
+
+  // The ONLY lock-release path (also used by the exit handler below). Removes
+  // the lock dir only if the pid file still names this process, or is
+  // absent/blank (we mkdir'd but hadn't written it yet). Another process may
+  // have legitimately broken our lock (stale/dead-holder rules in acquireLock)
+  // and re-acquired it — deleting THEIR lock would reopen the duplicate-load
+  // race the lock exists to prevent. Synchronous on purpose: rmSync + flag
+  // clear run with no await between them, so a second in-process waiter cannot
+  // observe a removed dir with holdingLock still true, and it works inside the
+  // sync-only "exit" handler. Never throws.
+  function releaseLockIfOurs() {
     try {
       let ours = true
       try {
         const pidStr = fs.readFileSync(path.join(opts.lockDir, "pid"), "utf8").trim()
-        ours = pidStr === "" || pidStr === String(process.pid) // absent pid ⇒ we mkdir'd but hadn't written it yet
+        ours = pidStr === "" || pidStr === String(process.pid)
       } catch {
         ours = true
       }
       if (ours) fs.rmSync(opts.lockDir, { recursive: true, force: true })
     } catch {}
+    holdingLock = false
+  }
+
+  // Last-resort release. A one-shot `opencode run` can exit while a background
+  // eager warm still holds the lock; process.on("exit") runs sync only.
+  // SIGKILL is uncatchable — the dead-holder liveness check in acquireLock is
+  // the backstop for that.
+  process.once("exit", () => {
+    if (holdingLock) releaseLockIfOurs()
   })
 
   function run(
@@ -318,26 +406,36 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
     return false
   }
 
-  let serverInflight: Promise<boolean> | null = null
+  const serverInflight = new Map<string, Promise<boolean>>()
   function ensureServer(baseURL: string): Promise<boolean> {
-    if (Date.now() - serverVerifiedAt < opts.verifyCacheMs) return Promise.resolve(true)
-    if (serverInflight) return serverInflight
-    serverInflight = ensureServerImpl(baseURL).finally(() => {
-      serverInflight = null
-    })
-    return serverInflight
+    if (Date.now() - (serverVerifiedAt.get(baseURL) ?? 0) < opts.verifyCacheMs) return Promise.resolve(true)
+    // Server-level negative cache: a failed bring-up (start + poll + optional
+    // app launch) can take minutes — fail fast for retryCooldownMs instead of
+    // re-paying that stall on every request while the server stays down.
+    if (Date.now() - (serverFailedAt.get(baseURL) ?? 0) < opts.retryCooldownMs) return Promise.resolve(false)
+    const existing = serverInflight.get(baseURL)
+    if (existing) return existing
+    const p = ensureServerImpl(baseURL)
+      .then((up) => {
+        if (up) serverFailedAt.delete(baseURL)
+        else serverFailedAt.set(baseURL, Date.now())
+        return up
+      })
+      .finally(() => serverInflight.delete(baseURL))
+    serverInflight.set(baseURL, p)
+    return p
   }
 
   async function ensureServerImpl(baseURL: string): Promise<boolean> {
     if (await httpAlive(baseURL)) {
-      serverVerifiedAt = Date.now()
+      serverVerifiedAt.set(baseURL, Date.now())
       return true
     }
     log(`HTTP server not reachable at ${baseURL} — running lms server start`)
     const started = await lms(["server", "start"], 30_000)
     if (!started.ok) log(`lms server start failed: ${started.stderr.trim().slice(0, 300)}`)
     if (await pollAlive(baseURL, opts.serverStartTimeoutMs)) {
-      serverVerifiedAt = Date.now()
+      serverVerifiedAt.set(baseURL, Date.now())
       log(`HTTP server is up at ${baseURL}`)
       return true
     }
@@ -348,7 +446,7 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
       await new Promise((r) => setTimeout(r, 3_000))
       await lms(["server", "start"], 30_000)
       if (await pollAlive(baseURL, opts.serverStartTimeoutMs)) {
-        serverVerifiedAt = Date.now()
+        serverVerifiedAt.set(baseURL, Date.now())
         log(`HTTP server is up at ${baseURL} (after app launch)`)
         return true
       }
@@ -367,15 +465,17 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
 
   // Cross-process mutex via atomic mkdir: parallel opencode workers must not
   // race lms load (it is not idempotent). A lock may be broken when (1) it is
-  // older than staleMs (no live holder can run that long — every command under
-  // the lock is killed at a hard timeout), (2) its recorded holder pid is dead
-  // (crash/abrupt exit before the finally released it — the observed eager-warm
-  // leak), or (3) the pid file is missing AND the dir has outlived a short grace
-  // (a holder that crashed between mkdir and writeFile). A fresh, pid-less lock
-  // is left alone: that is a live holder still mid-acquisition.
+  // older than staleMs — holders refresh the dir mtime before each long phase
+  // (touchLock in doWarm), so age measures the CURRENT phase and no live phase
+  // can outlast the load timeout, the longest hard cap; (2) its recorded
+  // holder pid is dead (crash/abrupt exit before the finally released it — the
+  // observed eager-warm leak); or (3) the pid file is missing AND the dir has
+  // outlived a short grace (a holder that crashed between mkdir and
+  // writeFile). A fresh, pid-less lock is left alone: that is a live holder
+  // still mid-acquisition.
   async function acquireLock(): Promise<(() => void) | null> {
     const deadline = Date.now() + opts.lockWaitTimeoutMs
-    const staleMs = opts.loadTimeoutMs + opts.serverStartTimeoutMs + 120_000
+    const staleMs = opts.loadTimeoutMs + 120_000
     const pidGraceMs = 5_000
     for (;;) {
       try {
@@ -384,16 +484,7 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
         try {
           await fsp.writeFile(path.join(opts.lockDir, "pid"), String(process.pid))
         } catch {}
-        // Synchronous release: rmSync + flag clear run with no await between them,
-        // so a second in-process waiter (parallel eager warm) cannot observe a
-        // removed dir with holdingLock still true, and the dir is gone even if
-        // the process is mid-teardown when release fires.
-        return () => {
-          try {
-            fs.rmSync(opts.lockDir, { recursive: true, force: true })
-          } catch {}
-          holdingLock = false
-        }
+        return releaseLockIfOurs
       } catch (err: any) {
         if (err?.code !== "EEXIST") throw err
         try {
@@ -416,15 +507,35 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
     }
   }
 
+  // The lms CLI manages only the LOCAL LM Studio: with a non-loopback baseURL
+  // the gate would load models on this machine while requests go elsewhere.
+  // Warn once per URL instead of failing — a LAN hostname can still be an
+  // alias for this host, and generation may work regardless.
+  function warnIfNonLoopback(baseURL: string) {
+    try {
+      const host = new URL(baseURL).hostname
+      if (host === "127.0.0.1" || host === "localhost" || host === "[::1]" || host === "::1") return
+      logOnce(
+        `WARNING: baseURL ${baseURL} is not loopback — lms manages only the LOCAL LM Studio, so the warm gate cannot ensure models on a remote server`,
+      )
+    } catch {}
+  }
+
   async function doWarm(key: string, baseURL: string): Promise<WarmResult> {
+    const cacheKey = `${baseURL}::${key}`
+    warnIfNonLoopback(baseURL)
     if (!(await ensureServer(baseURL))) {
       return { ok: false, confirmed: true, reason: `LM Studio HTTP server is not reachable at ${baseURL}` }
     }
 
-    // Fast path: no lock needed if already addressable.
-    let instances = await psInstances()
-    if (instances && addressable(instances, key)) {
-      verifiedAt.set(key, Date.now())
+    // Fast path: no lock needed if already addressable. An "unknown" ps state
+    // is ambiguous — never proceed toward a load on it (see classifyPs).
+    let check = classifyPs(await psInstances(), key)
+    if (check.state === "unknown") {
+      return { ok: false, confirmed: false, reason: "lms ps failed — model state unknown" }
+    }
+    if (check.state === "addressable") {
+      verifiedAt.set(cacheKey, Date.now())
       return OK
     }
 
@@ -435,11 +546,17 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
       log(`lock contention timeout waiting to warm ${key} — proceeding (ambiguous)`)
       return { ok: false, confirmed: false, reason: "lock contention timeout" }
     }
+    // Refresh the lock dir mtime before each long phase so acquireLock's
+    // age-based stale check measures the current phase, never the total hold.
+    const touchLock = () => fsp.utimes(opts.lockDir, new Date(), new Date()).catch(() => {})
     try {
       // Double-checked: another process may have loaded it while we waited.
-      instances = await psInstances()
-      if (instances && addressable(instances, key)) {
-        verifiedAt.set(key, Date.now())
+      check = classifyPs(await psInstances(), key)
+      if (check.state === "unknown") {
+        return { ok: false, confirmed: false, reason: "lms ps failed — model state unknown" }
+      }
+      if (check.state === "addressable") {
+        verifiedAt.set(cacheKey, Date.now())
         return OK
       }
 
@@ -447,16 +564,15 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
       // is addressable by the bare key (e.g. the original was unloaded and a
       // stray duplicate survived). Loading again would only stack key:3 —
       // reconcile by unloading idle duplicates first, then load fresh.
-      const dups = (instances ?? []).filter((i) => i.modelKey === key)
-      if (dups.length > 0) {
-        const busy = dups.some((i) => i.status === "generating" || (i.queued ?? 0) > 0)
-        if (!opts.reconcileDuplicates || busy) {
-          const ids = dups.map((i) => i.identifier).join(", ")
-          log(`WARNING: only non-addressable instances of ${key} exist (${ids}); busy=${busy} — cannot warm`)
+      if (check.state === "duplicates") {
+        if (!opts.reconcileDuplicates || check.busy) {
+          const ids = check.dups.map((i) => i.identifier).join(", ")
+          log(`WARNING: only non-addressable instances of ${key} exist (${ids}); busy=${check.busy} — cannot warm`)
           return { ok: false, confirmed: true, reason: `only suffixed duplicates of ${key} are resident (${ids})` }
         }
-        for (const d of dups) {
+        for (const d of check.dups) {
           if (!d.identifier) continue
+          await touchLock()
           log(`reconciling: unloading duplicate instance ${d.identifier}`)
           const un = await lms(["unload", d.identifier], 60_000)
           if (!un.ok) log(`unload ${d.identifier} failed: ${un.stderr.trim().slice(0, 200)}`)
@@ -465,6 +581,7 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
 
       const args = loadArgs(opts, key)
       log(`loading ${key} (${args.join(" ")}) ...`)
+      await touchLock()
       const t0 = Date.now()
       const res = await lms(args, opts.loadTimeoutMs)
       if (!res.ok) {
@@ -474,11 +591,18 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
         return { ok: false, confirmed: true, reason: `lms load failed (${kind}): ${detail.slice(0, 200)}` }
       }
 
-      instances = await psInstances()
-      if (instances && addressable(instances, key)) {
-        verifiedAt.set(key, Date.now())
+      const after = classifyPs(await psInstances(), key)
+      if (after.state === "addressable") {
+        verifiedAt.set(cacheKey, Date.now())
         log(`loaded ${key} in ${Math.round((Date.now() - t0) / 1000)}s`)
         return OK
+      }
+      if (after.state === "unknown") {
+        // The load exited 0; only the verification probe failed. Ambiguous —
+        // negative-caching this as confirmed would fail requests for up to
+        // retryCooldownMs against a model that is very likely loaded.
+        log(`lms load ${key} exited 0 but lms ps failed — cannot verify addressability`)
+        return { ok: false, confirmed: false, reason: "loaded but unverified (lms ps failed)" }
       }
       log(`lms load ${key} exited 0 but ps does not show identifier === key`)
       return { ok: false, confirmed: true, reason: `loaded but not addressable as "${key}"` }
@@ -488,12 +612,13 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
   }
 
   function warm(key: string, baseURL: string): Promise<WarmResult> {
-    if (Date.now() - (verifiedAt.get(key) ?? 0) < opts.verifyCacheMs) return Promise.resolve(OK)
-    const failed = failedAt.get(key)
+    const cacheKey = `${baseURL}::${key}`
+    if (Date.now() - (verifiedAt.get(cacheKey) ?? 0) < opts.verifyCacheMs) return Promise.resolve(OK)
+    const failed = failedAt.get(cacheKey)
     if (failed && Date.now() - failed.at < opts.retryCooldownMs) {
       return Promise.resolve({ ok: false, confirmed: true, reason: `${failed.reason} (cooldown)` })
     }
-    const existing = inflight.get(key)
+    const existing = inflight.get(cacheKey)
     if (existing) return existing
     const p = doWarm(key, baseURL)
       .catch((err): WarmResult => {
@@ -501,12 +626,12 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
         return { ok: false, confirmed: false, reason: "internal error (see log)" }
       })
       .then((r) => {
-        if (r.ok) failedAt.delete(key)
-        else if (r.confirmed) failedAt.set(key, { at: Date.now(), reason: r.reason })
+        if (r.ok) failedAt.delete(cacheKey)
+        else if (r.confirmed) failedAt.set(cacheKey, { at: Date.now(), reason: r.reason })
         return r
       })
-      .finally(() => inflight.delete(key))
-    inflight.set(key, p)
+      .finally(() => inflight.delete(cacheKey))
+    inflight.set(cacheKey, p)
     return p
   }
 
@@ -539,12 +664,23 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
       let result: WarmResult = OK
       let key: string | undefined
       try {
+        // Contract-drift canaries: this plugin depends on undocumented input
+        // shapes verified against opencode v1.17.10. If an upgrade changes
+        // them the gate silently no-ops — these one-time log lines are the
+        // only signal that would remain.
         const providerID: string | undefined = input?.provider?.info?.id ?? input?.model?.providerID
-        if (!providerID || !opts.providers.includes(providerID)) return
+        if (!providerID) {
+          logOnce("chat.params input carries no provider id — opencode hook shape may have changed; gate skipped")
+          return
+        }
+        if (!opts.providers.includes(providerID)) return
         // model.api.id is the exact string opencode sends as the API `model`
         // field (== LM Studio model key for config-defined models).
         key = input?.model?.api?.id ?? input?.model?.id
-        if (!key) return
+        if (!key) {
+          logOnce(`chat.params for gated provider "${providerID}" carries no model key — opencode hook shape may have changed; gate skipped`)
+          return
+        }
         const configured = input?.provider?.options?.baseURL
         const baseURL = typeof configured === "string" && configured.startsWith("http") ? configured : opts.baseURL
         result = await warm(key, baseURL)

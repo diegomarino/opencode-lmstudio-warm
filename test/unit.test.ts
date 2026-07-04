@@ -1,7 +1,10 @@
 import { describe, it, expect, vi } from "vitest"
 import {
   resolveOptions,
+  sanitizeOptions,
+  unknownOptionKeys,
   addressable,
+  classifyPs,
   parseModelRef,
   loadArgs,
   pidAlive,
@@ -31,16 +34,57 @@ describe("resolveOptions", () => {
     expect(o.ttlSeconds).toBe(10) // from file
   })
 
-  it("maps legacy failClosed:true → failMode 'closed'", () => {
-    expect(resolveOptions({}, { failClosed: true }).failMode).toBe("closed")
+  it("plugin failMode overrides file failMode", () => {
+    expect(resolveOptions({ failMode: "closed" }, { failMode: "open" }).failMode).toBe("open")
+  })
+})
+
+describe("unknownOptionKeys", () => {
+  it("lists keys the plugin does not know (typos are otherwise silently ignored)", () => {
+    expect(unknownOptionKeys({ verifycachems: 1, failMode: "open" })).toEqual(["verifycachems"])
   })
 
-  it("maps legacy failClosed:false → failMode 'open'", () => {
-    expect(resolveOptions({}, { failClosed: false }).failMode).toBe("open")
+  it("returns empty for known keys only, or an empty object", () => {
+    expect(unknownOptionKeys({})).toEqual([])
+    expect(unknownOptionKeys({ ttlSeconds: 5, eager: false })).toEqual([])
+  })
+})
+
+describe("sanitizeOptions", () => {
+  it("passes a valid config through unchanged with no warnings", () => {
+    const { opts: o, warnings } = sanitizeOptions(resolveOptions({}, { failMode: "closed", parallel: 2 }))
+    expect(warnings).toEqual([])
+    expect(o.failMode).toBe("closed")
+    expect(o.parallel).toBe(2)
   })
 
-  it("explicit failMode wins over legacy failClosed", () => {
-    expect(resolveOptions({}, { failClosed: true, failMode: "open" }).failMode).toBe("open")
+  it("falls back to the default 'hybrid' on an unrecognized failMode (a typo would otherwise behave as 'open')", () => {
+    const { opts: o, warnings } = sanitizeOptions(resolveOptions({ failMode: "Hybrid" as never }, null))
+    expect(o.failMode).toBe("hybrid")
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain("failMode")
+  })
+
+  it("resets providers to the default when not a non-empty string array", () => {
+    const { opts: o, warnings } = sanitizeOptions(resolveOptions({ providers: "lmstudio" as never }, null))
+    expect(o.providers).toEqual(["lmstudio"])
+    expect(warnings).toHaveLength(1)
+  })
+
+  it("resets negative or non-numeric numeric options to their defaults", () => {
+    const { opts: o, warnings } = sanitizeOptions(
+      resolveOptions({ verifyCacheMs: -5, loadTimeoutMs: "big" as never }, null),
+    )
+    expect(o.verifyCacheMs).toBe(30_000)
+    expect(o.loadTimeoutMs).toBe(900_000)
+    expect(warnings).toHaveLength(2)
+  })
+
+  it("resets wrong-typed booleans and empty strings to their defaults", () => {
+    const { opts: o, warnings } = sanitizeOptions(resolveOptions({ eager: "yes" as never, lmsPath: "" }, null))
+    expect(o.eager).toBe(true)
+    expect(o.lmsPath).not.toBe("")
+    expect(warnings).toHaveLength(2)
   })
 })
 
@@ -57,6 +101,42 @@ describe("addressable", () => {
 
   it("false on an empty instance list", () => {
     expect(addressable([], "qwen/q3")).toBe(false)
+  })
+})
+
+describe("classifyPs", () => {
+  const inst = (identifier: string, modelKey = identifier, extra: Partial<LmsInstance> = {}): LmsInstance => ({
+    identifier,
+    modelKey,
+    ...extra,
+  })
+
+  it("returns unknown when ps output is unavailable (null)", () => {
+    expect(classifyPs(null, "k")).toEqual({ state: "unknown" })
+  })
+
+  it("returns addressable when an instance identifier equals the key", () => {
+    expect(classifyPs([inst("k"), inst("other")], "k")).toEqual({ state: "addressable" })
+  })
+
+  it("returns absent when no instance of the model exists", () => {
+    expect(classifyPs([inst("other")], "k")).toEqual({ state: "absent" })
+    expect(classifyPs([], "k")).toEqual({ state: "absent" })
+  })
+
+  it("returns duplicates (not busy) when only suffixed instances exist", () => {
+    const dup = inst("k:2", "k")
+    expect(classifyPs([dup], "k")).toEqual({ state: "duplicates", dups: [dup], busy: false })
+  })
+
+  it("marks duplicates busy when one is generating", () => {
+    const dup = inst("k:2", "k", { status: "generating" })
+    expect(classifyPs([dup], "k")).toEqual({ state: "duplicates", dups: [dup], busy: true })
+  })
+
+  it("marks duplicates busy when one has queued requests", () => {
+    const dup = inst("k:2", "k", { queued: 3 })
+    expect(classifyPs([dup], "k")).toEqual({ state: "duplicates", dups: [dup], busy: true })
   })
 })
 
@@ -138,6 +218,11 @@ describe("parseLockPid", () => {
     expect(parseLockPid("")).toBeNull()
     expect(parseLockPid("abc")).toBeNull()
     expect(parseLockPid(null)).toBeNull()
+  })
+
+  it("returns null for non-positive pids (kill(-1, 0) would probe ALL processes)", () => {
+    expect(parseLockPid("-1")).toBeNull()
+    expect(parseLockPid("0")).toBeNull()
   })
 })
 

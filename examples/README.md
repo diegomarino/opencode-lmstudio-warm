@@ -10,7 +10,7 @@ strings opencode sends as the API `model` field).
 A minimal consumer config: the `plugin` array entry plus the `lmstudio` provider
 block (`baseURL`, `apiKey`, and the recommended `headerTimeout` / `chunkTimeout`).
 Merge it into your own `opencode.json` — the repo
-[README's Install section](../README.md#install) has an idempotent `jq` one-liner
+[README's Install section](../README.md#install-options) has an idempotent `jq` one-liner
 that does this non-destructively, or run `opencode plugin opencode-lmstudio-warm`
 to register the plugin and add only the provider block by hand.
 

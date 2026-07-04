@@ -20,8 +20,12 @@ Per request, the plugin checks that the model is actually loaded and, when it
 isn't, performs exactly one `lms load` (even across parallel sessions) before
 letting the request through.
 
-Verified against opencode **v1.17.10** and the local LM Studio + `lms` CLI on
-macOS/Apple Silicon (see [`test/e2e/verify.sh`](./test/e2e/verify.sh), 9/9 passing).
+Verified against opencode **v1.17.10** and **LM Studio 0.4.18** (`lms` CLI
+commit `6041ae0`) on macOS/Apple Silicon (see
+[`test/e2e/verify.sh`](./test/e2e/verify.sh), 9/9 passing). The LM Studio
+behaviors the plugin depends on are the `lms ps --json` field names
+(`modelKey` / `identifier` / `status` / `queued`) and the fact that
+`lms load` is not idempotent.
 
 ## Quick start
 
@@ -128,15 +132,33 @@ the JSON/`jq` above.
 
 The plugin works with zero configuration. Optional tuning lives in
 `~/.config/opencode/lmstudio-warm.json` (or inline as
-`"plugin": [["opencode-lmstudio-warm", {...}]]`): `providers`,
-`ttlSeconds`, `parallel` (size ≈ concurrent fleet width; overflow queues
-server-side), `contextLength`,
-`perModel: { "<key>": { parallel, ttlSeconds, contextLength } }`,
-`verifyCacheMs`, `retryCooldownMs`, `failMode` (`hybrid` default: confirmed
-failures fail the request with a clear error; ambiguous lock contention
-proceeds fail-open), `reconcileDuplicates`, `eager`, `logFile`.
+`"plugin": [["opencode-lmstudio-warm", {...}]]`).
 
-Log: `~/.cache/opencode/lmstudio-warm.log`.
+> **Scope:** the plugin manages the **local** LM Studio through the `lms` CLI.
+> `baseURL` (and any gated provider's `baseURL`) must point at this same
+> machine — a non-loopback URL is logged as a warning, and the gate can
+> neither verify nor load models on a remote server.
+
+| Option | Default | What it does |
+|--------|---------|--------------|
+| `providers` | `["lmstudio"]` | Provider IDs to gate; requests on other providers are ignored. All listed providers must address the local LM Studio. |
+| `lmsPath` | `~/.lmstudio/bin/lms` if present, else `lms` | Path to the `lms` CLI. |
+| `baseURL` | `http://127.0.0.1:1234/v1` | Fallback base URL when the provider config doesn't carry one. Must be loopback. |
+| `ttlSeconds` | `0` | `--ttl` for `lms load`; `0` omits the flag (resident until unloaded). |
+| `parallel` | `0` | `--parallel` for `lms load`; `0` omits it (LM Studio default, currently 4). Size ≈ concurrent fleet width; overflow queues server-side. |
+| `contextLength` | `0` | `--context-length` for `lms load`; `0` omits it (model default). |
+| `perModel` | `{}` | Per-model-key overrides of `ttlSeconds` / `parallel` / `contextLength`. |
+| `verifyCacheMs` | `30000` | How long a positive residency verdict is trusted before re-checking. |
+| `retryCooldownMs` | `60000` | After a confirmed load failure, don't retry the same key for this long (prevents load storms). |
+| `loadTimeoutMs` | `900000` | Hard cap on a single `lms load` (a cold big-model load can take minutes). |
+| `serverStartTimeoutMs` | `90000` | Hard cap on bringing the HTTP server up. |
+| `lockWaitTimeoutMs` | `1200000` | Max wait for another process's in-flight load before proceeding fail-open. |
+| `failMode` | `"hybrid"` | `hybrid`: confirmed failures fail the request with a clear error, ambiguous ones proceed fail-open. `open`: never fail. `closed`: any warm failure fails the request. |
+| `reconcileDuplicates` | `true` | Unload idle suffixed duplicates (`key:2` …) and load fresh when the bare key isn't addressable. |
+| `launchAppFallback` | `true` | If the server won't start, try `open -ga "LM Studio"` once (macOS only). |
+| `eager` | `true` | Background-warm `model` + `small_model` at instance start. |
+| `logFile` | `~/.cache/opencode/lmstudio-warm.log` | Plugin log file; rotated to `<logFile>.old` once it grows past ~5 MB. |
+| `lockDir` | `~/.cache/opencode/lmstudio-warm.lock` | Cross-process lock directory. |
 
 See `examples/lmstudio-warm.json` for a fleet-tuned starting point
 (`cp examples/lmstudio-warm.json ~/.config/opencode/lmstudio-warm.json`).
@@ -287,8 +309,9 @@ building, addressability, pid liveness, fail-mode decisions) is exported from
 `src/index.ts` and unit-tested under `test/`; the live system behavior is covered
 by the E2E fixture under [`test/e2e/`](./test/e2e/).
 
-Releases follow [SemVer](https://semver.org) and are cut by CI on `v*` tags
-(see [`CHANGELOG.md`](./CHANGELOG.md)).
+Releases follow [SemVer](https://semver.org) and are cut automatically by
+semantic-release on every push to `main` — Conventional Commits decide the
+bump (see [`CHANGELOG.md`](./CHANGELOG.md)).
 
 ## Disclaimer
 

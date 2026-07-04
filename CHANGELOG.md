@@ -1,3 +1,5 @@
+## [0.1.1](https://github.com/diegomarino/opencode-lmstudio-warm/compare/v0.1.0...v0.1.1) (2026-07-04)
+
 # Changelog
 
 All notable changes to this project are documented here.

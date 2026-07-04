@@ -8,7 +8,8 @@ repo's `src/index.ts`), so it exercises the actual plugin with no build or copy.
 ```
 test/e2e/
 ├── verify.sh                     # the 9-check harness
-├── opencode.json                 # fixture config (edit the placeholders)
+├── opencode.template.json        # fixture config template (placeholders)
+├── opencode.json                 # rendered by verify.sh from the template (gitignored)
 └── .opencode/plugin/
     └── lmstudio-warm.ts          # re-export of ../../../../src/index.ts
 ```
@@ -29,18 +30,18 @@ test/e2e/
 
 ## What to edit
 
-The fixture ships with `your-main-model-key` / `your-small-model-key`
-placeholders. Point them at two real LM Studio model keys (the exact strings
-opencode sends as the API `model` field — e.g. what `lms ps --json` shows as
-`modelKey`). Two ways:
+Nothing — just pass two real LM Studio model keys (the exact strings opencode
+sends as the API `model` field — e.g. what `lms ps --json` shows as `modelKey`)
+via env:
 
-- **Env override (no file edits, recommended):**
-  ```bash
-  MAIN="your/real-main-model" SMALL="your-real-small-model" ./test/e2e/verify.sh
-  ```
-- **Or edit `opencode.json`** in this directory: replace the placeholder keys in
-  `model`, `small_model`, and `provider.lmstudio.models`, and set `MAIN`/`SMALL`
-  in `verify.sh` (or via env) to match.
+```bash
+MAIN="your/real-main-model" SMALL="your-real-small-model" ./test/e2e/verify.sh
+```
+
+`verify.sh` refuses to run with the placeholder defaults, and renders
+`opencode.json` (gitignored) from `opencode.template.json` with your keys, so
+the whole fixture config — `model`, `small_model`, `provider.lmstudio.models` —
+matches what the checks assert against.
 
 Other overridable vars: `LMS` (path to the `lms` CLI, default
 `~/.lmstudio/bin/lms`).

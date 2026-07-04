@@ -2,8 +2,11 @@
 # Live E2E fixture for the lmstudio-warm opencode plugin. See ./README.md.
 #
 # Set MAIN and SMALL to two real LM Studio model keys before running (the
-# defaults are placeholders). This script `cd`s to its own directory, where the
-# fixture opencode.json + .opencode/plugin/ make the plugin auto-load.
+# defaults are placeholders and the script refuses to run with them). It `cd`s
+# to its own directory and renders opencode.json (gitignored) from
+# opencode.template.json with those keys, so the WHOLE fixture config —
+# model, small_model, provider.models — uses real keys and the plugin's eager
+# warm never chases a placeholder; .opencode/plugin/ makes the plugin auto-load.
 # Requires: jq, lms, opencode, and a running LM Studio with both models present.
 #
 # If LM Studio API auth is enabled, export LM_API_TOKEN first for full
@@ -17,6 +20,17 @@ MAIN="${MAIN:-your-main-model-key}"
 SMALL="${SMALL:-your-small-model-key}"
 LOG="$HOME/.cache/opencode/lmstudio-warm.log"
 cd "$(dirname "$0")" || exit 1
+
+case "$MAIN$SMALL" in
+  *your-*-model-key*) echo "Set MAIN and SMALL to two real LM Studio model keys (see ./README.md)" >&2; exit 2 ;;
+esac
+
+# Render the fixture config from the template (rendered file is gitignored).
+jq --arg m "$MAIN" --arg s "$SMALL" '
+  .model = "lmstudio/" + $m
+  | .small_model = "lmstudio/" + $s
+  | .provider.lmstudio.models = { ($m): { name: "E2E main model" }, ($s): { name: "E2E small model" } }
+' opencode.template.json > opencode.json || exit 1
 
 pass=0; fail=0
 say()    { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }

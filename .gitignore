@@ -19,6 +19,10 @@ lmstudio-warm.log
 # public reference lives in examples/opencode.json.
 /opencode.json
 
+# Rendered by verify.sh from opencode.template.json with the real MAIN/SMALL
+# keys — never commit real keys; the tracked template keeps placeholders.
+/test/e2e/opencode.json
+
 # Root .opencode/ is re-bootstrapped by opencode when run in this repo
 # (node_modules, lockfiles). Anchored so the test/e2e/.opencode/ fixture is kept.
 /.opencode/

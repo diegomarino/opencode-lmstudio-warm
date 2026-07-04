@@ -1,6 +1,5 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "//": "Consumer example: wire the plugin via npm. opencode auto-installs the package named in `plugin` and loads it before every request. Copy the `plugin` line and the `lmstudio` provider block into your own opencode.json, then set your model/small_model and LM_API_TOKEN.",
   "plugin": ["opencode-lmstudio-warm"],
   "model": "lmstudio/your-main-model-key",
   "small_model": "lmstudio/your-small-model-key",

@@ -2,10 +2,15 @@
 
 ## [0.1.2](https://github.com/diegomarino/opencode-lmstudio-warm/compare/v0.1.1...v0.1.2) (2026-07-04)
 
-All notable changes are documented here. From v0.1.1 onward, entries are
-generated automatically by [semantic-release](https://semver.org) from
-[Conventional Commits](https://www.conventionalcommits.org). While the version
-is `0.x`, a MINOR bump may include breaking changes (SemVer 0.x rule).
+### Bug Fixes
+
+- close warm-gate races and harden failure handling ([d26fc4b](https://github.com/diegomarino/opencode-lmstudio-warm/commit/d26fc4b))
+- make example and E2E configs valid for opencode's config schema ([b2b2741](https://github.com/diegomarino/opencode-lmstudio-warm/commit/b2b2741))
+
+### Documentation
+
+- pin LM Studio version, full option table, fix stale claims ([618ba8a](https://github.com/diegomarino/opencode-lmstudio-warm/commit/618ba8a))
+- restructure changelog and pin semantic-release changelogTitle ([977bd7f](https://github.com/diegomarino/opencode-lmstudio-warm/commit/977bd7f))
 
 ## [0.1.1](https://github.com/diegomarino/opencode-lmstudio-warm/compare/v0.1.0...v0.1.1) (2026-07-04)
 
@@ -46,3 +51,11 @@ Initial public release.
   lock immediately when its holder pid is dead (or the pid file is absent past a
   grace window), the release is synchronous, and a `process.on("exit")` handler
   is a last-resort cleanup. Verified 9/9 against a live LM Studio fleet.
+
+---
+
+All notable changes are documented here. From v0.1.1 onward, entries are
+generated automatically by
+[semantic-release](https://github.com/semantic-release/semantic-release) from
+[Conventional Commits](https://www.conventionalcommits.org). While the version
+is `0.x`, a MINOR bump may include breaking changes (SemVer 0.x rule).

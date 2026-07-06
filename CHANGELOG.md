@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.0](https://github.com/diegomarino/opencode-lmstudio-warm/compare/v0.1.2...v0.2.0) (2026-07-06)
+
+### Features
+
+* opt-in RAM-pressure eviction to make room before load ([424d978](https://github.com/diegomarino/opencode-lmstudio-warm/commit/424d978ec1fe9171dd043037518f09932fdfad67))
+
+### Documentation
+
+* repair generated-empty changelog entries and anchor the intro ([8013047](https://github.com/diegomarino/opencode-lmstudio-warm/commit/8013047a2c22f8232f5e3855705570b69e4c1d79))
+
+### Build System
+
+* pin conventional-changelog-conventionalcommits to 8.0.0 ([6ec3dc7](https://github.com/diegomarino/opencode-lmstudio-warm/commit/6ec3dc70717de8a8dfe24cc709c8d9329488abed))
+
 ## [0.1.2](https://github.com/diegomarino/opencode-lmstudio-warm/compare/v0.1.1...v0.1.2) (2026-07-04)
 
 ### Bug Fixes

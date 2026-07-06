@@ -10,9 +10,16 @@ import {
   pidAlive,
   parseLockPid,
   shouldFailRequest,
+  resolveBudgetBytes,
+  parseModelSize,
+  evictionCandidates,
+  planEviction,
+  isMemoryPressureError,
   type WarmOptions,
   type LmsInstance,
 } from "../src/index.ts"
+
+const MiB = 1024 * 1024
 
 // A concrete options object for loadArgs tests (only the fields it reads matter).
 function opts(over: Partial<WarmOptions> = {}): WarmOptions {
@@ -85,6 +92,21 @@ describe("sanitizeOptions", () => {
     expect(o.eager).toBe(true)
     expect(o.lmsPath).not.toBe("")
     expect(warnings).toHaveLength(2)
+  })
+
+  it("resets a non-string-array evictProtect to the default empty list", () => {
+    const { opts: o, warnings } = sanitizeOptions(resolveOptions({ evictProtect: [1, "ok"] as never }, null))
+    expect(o.evictProtect).toEqual([])
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain("evictProtect")
+  })
+
+  it("defaults evictMaxVictims to 8 and resets a negative value to the default", () => {
+    expect(resolveOptions({}, null).evictMaxVictims).toBe(8)
+    const { opts: o, warnings } = sanitizeOptions(resolveOptions({ evictMaxVictims: -3 }, null))
+    expect(o.evictMaxVictims).toBe(8)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain("evictMaxVictims")
   })
 })
 
@@ -250,5 +272,172 @@ describe("shouldFailRequest", () => {
   it("open never fails", () => {
     expect(shouldFailRequest("open", confirmed)).toBe(false)
     expect(shouldFailRequest("open", ambiguous)).toBe(false)
+  })
+})
+
+// ─── RAM-pressure eviction helpers ──────────────────────────────────────────
+
+describe("resolveBudgetBytes", () => {
+  it("uses an explicit ramBudgetMB (MiB → bytes) when > 0", () => {
+    expect(resolveBudgetBytes(opts({ ramBudgetMB: 120_000 }), 137 * 1000 * MiB)).toBe(120_000 * MiB)
+  })
+
+  it("falls back to 90% of total physical memory when ramBudgetMB is 0", () => {
+    expect(resolveBudgetBytes(opts({ ramBudgetMB: 0 }), 100 * MiB)).toBe(Math.floor(100 * MiB * 0.9))
+  })
+})
+
+describe("parseModelSize", () => {
+  const ls = [
+    { modelKey: "qwen/qwen3.6-27b", sizeBytes: 16_081_685_402 },
+    { modelKey: "qwen3-coder-next", sizeBytes: 64_761_608_791 },
+  ]
+
+  it("returns sizeBytes for the matching modelKey", () => {
+    expect(parseModelSize(ls, "qwen3-coder-next")).toBe(64_761_608_791)
+  })
+
+  it("returns null when the key is not among downloaded models", () => {
+    expect(parseModelSize(ls, "nope")).toBeNull()
+  })
+
+  it("returns null when the ls output is unavailable (null) or a size is missing", () => {
+    expect(parseModelSize(null, "qwen3-coder-next")).toBeNull()
+    expect(parseModelSize([{ modelKey: "x" }], "x")).toBeNull()
+  })
+})
+
+describe("evictionCandidates", () => {
+  const inst = (identifier: string, over: Partial<LmsInstance> = {}): LmsInstance => ({
+    identifier,
+    modelKey: identifier,
+    status: "idle",
+    queued: 0,
+    lastUsedTime: 1000,
+    sizeBytes: 1,
+    ...over,
+  })
+
+  it("never returns the target (by identifier or by modelKey)", () => {
+    const dup = inst("t:2", { modelKey: "t" })
+    const got = evictionCandidates([inst("t"), dup, inst("a")], "t", [])
+    expect(got.map((i) => i.identifier)).toEqual(["a"])
+  })
+
+  it("excludes busy instances (generating, or queued > 0)", () => {
+    const got = evictionCandidates(
+      [inst("gen", { status: "generating" }), inst("q", { queued: 2 }), inst("idle")],
+      "t",
+      [],
+    )
+    expect(got.map((i) => i.identifier)).toEqual(["idle"])
+  })
+
+  it("excludes protected keys (matched by modelKey or identifier)", () => {
+    const got = evictionCandidates([inst("keep"), inst("drop")], "t", ["keep"])
+    expect(got.map((i) => i.identifier)).toEqual(["drop"])
+  })
+
+  it("excludes instances without an identifier", () => {
+    const got = evictionCandidates([{ modelKey: "x", status: "idle", queued: 0 }, inst("ok")], "t", [])
+    expect(got.map((i) => i.identifier)).toEqual(["ok"])
+  })
+
+  it("orders least-recently-used first; a missing lastUsedTime sorts first", () => {
+    const got = evictionCandidates(
+      [inst("newest", { lastUsedTime: 3000 }), inst("oldest", { lastUsedTime: 1000 }), inst("never", { lastUsedTime: undefined })],
+      "t",
+      [],
+    )
+    expect(got.map((i) => i.identifier)).toEqual(["never", "oldest", "newest"])
+  })
+})
+
+describe("planEviction", () => {
+  const gb = (n: number) => n * 1024 * MiB
+  const inst = (identifier: string, sizeGB: number, over: Partial<LmsInstance> = {}): LmsInstance => ({
+    identifier,
+    modelKey: identifier,
+    status: "idle",
+    queued: 0,
+    lastUsedTime: 1000,
+    sizeBytes: gb(sizeGB),
+    ...over,
+  })
+
+  it("evicts nothing when the target already fits within budget", () => {
+    // budget 120, used 16, need 16 + 4 headroom = 20 ≤ 104 available
+    const plan = planEviction({
+      instances: [inst("resident", 16)],
+      targetKey: "new",
+      targetSizeBytes: gb(16),
+      budgetBytes: gb(120),
+      headroomBytes: gb(4),
+      protect: [],
+    })
+    expect(plan).toEqual({ victims: [], fitsAfter: true })
+  })
+
+  it("evicts the LRU idle victim to make room, and stops once it fits", () => {
+    // budget 120, one idle 65GB resident + one idle 16GB; target 27 + 4 headroom = 31.
+    // available = 120 - 81 = 39 ≥ 31 already? no: 39 ≥ 31 → fits without eviction.
+    // Shrink budget to 100 so used 81 leaves 19 < 31 → must evict LRU (the 65GB).
+    const big = inst("coder-next", 65, { lastUsedTime: 1000 })
+    const small = inst("q27", 16, { lastUsedTime: 5000 })
+    const plan = planEviction({
+      instances: [big, small],
+      targetKey: "new",
+      targetSizeBytes: gb(27),
+      budgetBytes: gb(100),
+      headroomBytes: gb(4),
+      protect: [],
+    })
+    expect(plan.victims.map((v) => v.identifier)).toEqual(["coder-next"])
+    expect(plan.fitsAfter).toBe(true)
+  })
+
+  it("reports fitsAfter=false when even evicting every candidate is not enough", () => {
+    const big = inst("coder-next", 65)
+    const plan = planEviction({
+      instances: [big],
+      targetKey: "new",
+      targetSizeBytes: gb(200),
+      budgetBytes: gb(100),
+      headroomBytes: gb(4),
+      protect: [],
+    })
+    expect(plan.victims.map((v) => v.identifier)).toEqual(["coder-next"])
+    expect(plan.fitsAfter).toBe(false)
+  })
+
+  it("never selects a busy or protected instance as a victim", () => {
+    const busy = inst("busy", 65, { status: "generating" })
+    const plan = planEviction({
+      instances: [busy],
+      targetKey: "new",
+      targetSizeBytes: gb(27),
+      budgetBytes: gb(80),
+      headroomBytes: gb(4),
+      protect: [],
+    })
+    expect(plan.victims).toEqual([])
+    expect(plan.fitsAfter).toBe(false)
+  })
+})
+
+describe("isMemoryPressureError", () => {
+  it("matches LM Studio guardrail / out-of-memory rejections", () => {
+    expect(isMemoryPressureError("Model loading was aborted by the guardrail")).toBe(true)
+    expect(isMemoryPressureError("not enough memory to load model")).toBe(true)
+    expect(isMemoryPressureError("insufficient VRAM available")).toBe(true)
+    expect(isMemoryPressureError("Error: out of memory")).toBe(true)
+  })
+
+  it("does NOT fire on config errors that merely share a keyword (avoids evicting healthy models)", () => {
+    expect(isMemoryPressureError("context length 262144 exceeds max 32768")).toBe(false)
+    expect(isMemoryPressureError("insufficient disk space")).toBe(false)
+    expect(isMemoryPressureError("insufficient permissions")).toBe(false)
+    expect(isMemoryPressureError("model not found")).toBe(false)
+    expect(isMemoryPressureError("")).toBe(false)
   })
 })

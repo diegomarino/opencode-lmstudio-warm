@@ -90,6 +90,30 @@ export type WarmOptions = {
   launchAppFallback: boolean
   /** Warm cfg.model + cfg.small_model in the background at instance start. */
   eager: boolean
+  /**
+   * Reactive RAM-pressure eviction (opt-in, default OFF). When a target model
+   * is not addressable and must be loaded, first make room by unloading IDLE
+   * instances (never busy, never the target, never protected) in LRU order so
+   * the load fits under a memory guardrail instead of being refused. See the
+   * eviction block in doWarm.
+   */
+  evictOnPressure: boolean
+  /** RAM the fleet may use for LM Studio, in MB. 0 = auto (90% of total physical
+   *  memory). The fit calc uses this as the denominator, NOT os.freemem() —
+   *  freemem under-reports available memory on macOS (it excludes cached pages). */
+  ramBudgetMB: number
+  /** Flat margin (MB) added over a model's on-disk weight size when deciding if
+   *  it fits. See EVICT_HEADROOM_NOTE in doWarm for why this is deliberately a
+   *  flat number today rather than a context×parallel KV-cache estimate. */
+  evictHeadroomMB: number
+  /** Model keys (or instance identifiers) never unloaded by eviction. */
+  evictProtect: string[]
+  /** Max instances eviction may unload per warm attempt (predictive + reactive
+   *  combined). A ceiling on lock-hold time: each eviction plus its load retry
+   *  can cost up to loadTimeoutMs, so an unbounded reactive loop could hold the
+   *  cross-process lock for N × loadTimeoutMs. 0 = unlimited (bounded only by the
+   *  idle-instance count). See the evicted-set check in unloadIfIdle. */
+  evictMaxVictims: number
   logFile: string
   lockDir: string
 }
@@ -113,9 +137,20 @@ const DEFAULTS: WarmOptions = {
   reconcileDuplicates: true,
   launchAppFallback: true,
   eager: true,
+  evictOnPressure: false,
+  ramBudgetMB: 0,
+  evictHeadroomMB: 4096,
+  evictProtect: [],
+  evictMaxVictims: 8,
   logFile: path.join(HOME, ".cache/opencode/lmstudio-warm.log"),
   lockDir: path.join(HOME, ".cache/opencode/lmstudio-warm.lock"),
 }
+
+/** Fraction of total physical memory used as the eviction budget when
+ *  ramBudgetMB is 0 (auto). Leaves headroom for the OS, other apps, and the
+ *  gap between weight bytes and true runtime footprint. */
+const RAM_BUDGET_AUTO_FRACTION = 0.9
+const BYTES_PER_MB = 1024 * 1024
 
 function loadFileOptions(): Partial<WarmOptions> {
   try {
@@ -134,6 +169,10 @@ export type LmsInstance = {
   ttlMs?: number | null
   parallel?: number
   queued?: number
+  /** On-disk weight size (bytes) as reported by `lms ps`/`lms ls`. */
+  sizeBytes?: number
+  /** Epoch ms of last use — the LRU signal for eviction. */
+  lastUsedTime?: number
 }
 
 /** Warm outcome. `confirmed` marks a definitive failure (vs. ambiguity). */
@@ -165,8 +204,11 @@ const NUMERIC_KEYS = [
   "loadTimeoutMs",
   "serverStartTimeoutMs",
   "lockWaitTimeoutMs",
+  "ramBudgetMB",
+  "evictHeadroomMB",
+  "evictMaxVictims",
 ] as const
-const BOOLEAN_KEYS = ["reconcileDuplicates", "launchAppFallback", "eager"] as const
+const BOOLEAN_KEYS = ["reconcileDuplicates", "launchAppFallback", "eager", "evictOnPressure"] as const
 const STRING_KEYS = ["lmsPath", "baseURL", "logFile", "lockDir"] as const
 
 /** Repair invalid option VALUES back to their defaults, collecting one
@@ -187,6 +229,8 @@ export function sanitizeOptions(o: WarmOptions): { opts: WarmOptions; warnings: 
   for (const k of BOOLEAN_KEYS) if (typeof out[k] !== "boolean") fix(k, "must be a boolean")
   for (const k of STRING_KEYS) if (typeof out[k] !== "string" || out[k] === "") fix(k, "must be a non-empty string")
   if (out.perModel === null || typeof out.perModel !== "object" || Array.isArray(out.perModel)) fix("perModel", "must be an object")
+  if (!Array.isArray(out.evictProtect) || out.evictProtect.some((p) => typeof p !== "string"))
+    fix("evictProtect", "must be a string array")
   return { opts: out, warnings }
 }
 
@@ -240,6 +284,90 @@ export function loadArgs(opts: WarmOptions, key: string): string[] {
   if (parallel > 0) args.push("--parallel", String(parallel))
   if (ctx > 0) args.push("--context-length", String(ctx))
   return args
+}
+
+// ─── RAM-pressure eviction (pure) ───────────────────────────────────────────
+
+/** The RAM budget (bytes) eviction plans against. An explicit ramBudgetMB wins;
+ *  otherwise a fixed fraction of total PHYSICAL memory. Deliberately not
+ *  os.freemem(): on macOS freemem excludes cached/purgeable pages and so
+ *  under-reports what a load can actually use, which would over-evict. */
+export function resolveBudgetBytes(opts: WarmOptions, totalmemBytes: number): number {
+  if (opts.ramBudgetMB > 0) return opts.ramBudgetMB * BYTES_PER_MB
+  return Math.floor(totalmemBytes * RAM_BUDGET_AUTO_FRACTION)
+}
+
+/** The target model's on-disk weight size from `lms ls --json` (all downloaded
+ *  models, loaded or not), or null when unavailable — the fit calc then can't
+ *  run and doWarm falls back to the reactive backstop. */
+export function parseModelSize(lsArray: Array<{ modelKey?: string; sizeBytes?: number }> | null, key: string): number | null {
+  if (lsArray === null) return null
+  const hit = lsArray.find((m) => m.modelKey === key)
+  return typeof hit?.sizeBytes === "number" ? hit.sizeBytes : null
+}
+
+/** Instances that are SAFE to unload to make room, least-recently-used first.
+ *  Excludes the target itself (by identifier AND modelKey, so its duplicates
+ *  are spared too), busy instances (generating or with queued work), protected
+ *  keys/identifiers, and anything without an identifier to unload. A missing
+ *  lastUsedTime sorts first (treated as oldest). */
+export function evictionCandidates(instances: LmsInstance[], targetKey: string, protect: string[]): LmsInstance[] {
+  return instances
+    .filter(
+      (i) =>
+        typeof i.identifier === "string" &&
+        i.identifier !== targetKey &&
+        i.modelKey !== targetKey &&
+        i.status !== "generating" &&
+        (i.queued ?? 0) === 0 &&
+        !protect.includes(i.identifier) &&
+        !protect.includes(i.modelKey ?? ""),
+    )
+    .sort((a, b) => (a.lastUsedTime ?? 0) - (b.lastUsedTime ?? 0))
+}
+
+export type EvictionPlan = { victims: LmsInstance[]; fitsAfter: boolean }
+
+/** Decide which idle instances to unload so the target fits under budget.
+ *  needed = targetSize + headroom; available = budget − currentUsage. If that
+ *  is already enough, no eviction. Otherwise walk candidates LRU-first,
+ *  accumulating freed bytes until the target fits or candidates run out.
+ *  `fitsAfter=false` means even evicting every candidate is not enough — the
+ *  caller may still try to load (a partial guardrail may relent) but shouldn't
+ *  expect success. */
+export function planEviction(p: {
+  instances: LmsInstance[]
+  targetKey: string
+  targetSizeBytes: number
+  budgetBytes: number
+  headroomBytes: number
+  protect: string[]
+}): EvictionPlan {
+  const currentUsage = p.instances.reduce((sum, i) => sum + (i.sizeBytes ?? 0), 0)
+  const needed = p.targetSizeBytes + p.headroomBytes
+  let available = p.budgetBytes - currentUsage
+  if (available >= needed) return { victims: [], fitsAfter: true }
+
+  const victims: LmsInstance[] = []
+  for (const c of evictionCandidates(p.instances, p.targetKey, p.protect)) {
+    victims.push(c)
+    available += c.sizeBytes ?? 0
+    if (available >= needed) break
+  }
+  return { victims, fitsAfter: available >= needed }
+}
+
+/** Does an `lms load` failure look like a RAM/guardrail rejection (so the
+ *  reactive backstop should free room and retry)? Strict on purpose: matching a
+ *  config error (e.g. "context length … exceeds max", "insufficient disk
+ *  space", "insufficient permissions") would wrongly unload healthy idle models
+ *  for a load that can never succeed until the config changes. */
+export function isMemoryPressureError(text: string): boolean {
+  const s = text.toLowerCase()
+  if (s.includes("guardrail")) return true
+  if (s.includes("out of memory") || /\boom\b/.test(s)) return true
+  if (/not enough|insufficient/.test(s) && /\b(memory|ram|vram)\b/.test(s)) return true
+  return false
 }
 
 /** Is a process alive? `kill(pid, 0)` sends no signal, just probes: ESRCH ⇒
@@ -521,6 +649,108 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
     } catch {}
   }
 
+  async function lmsLs(): Promise<Array<{ modelKey?: string; sizeBytes?: number }> | null> {
+    const res = await lms(["ls", "--json"], 15_000)
+    if (!res.ok) {
+      log(`lms ls failed: ${res.stderr.trim().slice(0, 200)}`)
+      return null
+    }
+    try {
+      const parsed = JSON.parse(res.stdout)
+      return Array.isArray(parsed) ? parsed : null
+    } catch {
+      log(`lms ls returned non-JSON: ${res.stdout.slice(0, 200)}`)
+      return null
+    }
+  }
+
+  // Unload one instance ONLY if a fresh ps still shows it as an eviction
+  // candidate (idle, non-target, non-protected). The re-check guards the window
+  // between an eviction plan and the unload: on a shared box a model can go busy
+  // from the LM Studio UI or another client, which our lock does not coordinate
+  // with — unloading it then would kill a live generation. Records the id in
+  // `evicted` so a single warm attempt never tries the same victim twice.
+  async function unloadIfIdle(identifier: string, key: string, evicted: Set<string>, touchLock: () => Promise<void>): Promise<boolean> {
+    if (evicted.has(identifier)) return false
+    // Cap total unloads per warm attempt (predictive + reactive share `evicted`).
+    // Bounds worst-case lock-hold: each eviction plus its load retry can cost up
+    // to loadTimeoutMs, so without a ceiling a long idle fleet could hold the
+    // cross-process lock for N × loadTimeoutMs and starve other workers.
+    if (opts.evictMaxVictims > 0 && evicted.size >= opts.evictMaxVictims) {
+      logOnce(`eviction: reached evictMaxVictims=${opts.evictMaxVictims} this attempt — not unloading further (raise evictMaxVictims, or 0 to disable the cap)`)
+      return false
+    }
+    const fresh = await psInstances()
+    if (fresh === null) return false // ambiguous ps — never unload blind
+    const stillSafe = evictionCandidates(fresh, key, opts.evictProtect).some((c) => c.identifier === identifier)
+    if (!stillSafe) {
+      log(`eviction: skipping ${identifier} — no longer idle/evictable`)
+      return false
+    }
+    await touchLock()
+    log(`eviction: unloading idle instance ${identifier} to make room for ${key}`)
+    const un = await lms(["unload", identifier], 60_000)
+    evicted.add(identifier)
+    if (!un.ok) {
+      log(`eviction: unload ${identifier} failed: ${un.stderr.trim().slice(0, 200)}`)
+      return false
+    }
+    return true
+  }
+
+  // Predictive pre-eviction: if the target's weight size + headroom won't fit
+  // under the RAM budget, unload idle LRU instances to make room BEFORE the
+  // load, so a load the memory guardrail would otherwise refuse can proceed.
+  // Best-effort — the reactive backstop in doWarm's load loop covers any
+  // under-prediction. Silently no-ops (relies on the backstop) whenever the
+  // inputs are ambiguous: ps unavailable, or the target's size unknown.
+  async function preEvict(key: string, evicted: Set<string>, touchLock: () => Promise<void>) {
+    const instances = await psInstances()
+    if (instances === null) return
+    const targetSize = parseModelSize(await lmsLs(), key)
+    if (targetSize === null) {
+      log(`eviction: target ${key} size unknown (lms ls) — skipping predictive step, relying on reactive backstop`)
+      return
+    }
+    // EVICT_HEADROOM_NOTE: headroom is deliberately a single flat number today,
+    // not a context×parallel KV-cache estimate. An accurate KV size needs
+    // per-architecture internals (layers, kv-heads, head-dim) that ps/ls do not
+    // expose, so any formula would be a guess with a false air of precision.
+    // The reactive backstop already handles under-prediction by freeing more
+    // room and retrying, so a flat margin that catches the gross case (evict an
+    // idle 65GB to fit a 27B) is enough. Revisit if the SDK ever exposes real
+    // runtime footprint. This warning surfaces the one case flat headroom is
+    // most likely to under-shoot.
+    if (opts.evictHeadroomMB === DEFAULTS.evictHeadroomMB && (opts.contextLength > 8192 || opts.parallel > 1)) {
+      logOnce(
+        `eviction: evictHeadroomMB is at its default ${DEFAULTS.evictHeadroomMB}MB but contextLength/parallel are large — KV cache may exceed it; raise evictHeadroomMB if loads are still refused`,
+      )
+    }
+    const budgetBytes = resolveBudgetBytes(opts, os.totalmem())
+    const headroomBytes = opts.evictHeadroomMB * BYTES_PER_MB
+    const plan = planEviction({ instances, targetKey: key, targetSizeBytes: targetSize, budgetBytes, headroomBytes, protect: opts.evictProtect })
+    if (plan.victims.length === 0) return
+    log(
+      `eviction: ${key} (${Math.round(targetSize / BYTES_PER_MB)}MB) needs room under budget ${Math.round(budgetBytes / BYTES_PER_MB)}MB — unloading ${plan.victims.length} idle instance(s); fitsAfter=${plan.fitsAfter}`,
+    )
+    for (const v of plan.victims) {
+      if (v.identifier) await unloadIfIdle(v.identifier, key, evicted, touchLock)
+    }
+  }
+
+  // Reactive backstop: free the single next LRU idle instance not already
+  // evicted this attempt, so the guardrail-refused load can be retried. Returns
+  // the freed identifier, or null when nothing idle remains to unload.
+  async function evictNextIdle(key: string, evicted: Set<string>, touchLock: () => Promise<void>): Promise<string | null> {
+    const fresh = await psInstances()
+    if (fresh === null) return null
+    for (const c of evictionCandidates(fresh, key, opts.evictProtect)) {
+      if (!c.identifier || evicted.has(c.identifier)) continue
+      if (await unloadIfIdle(c.identifier, key, evicted, touchLock)) return c.identifier
+    }
+    return null
+  }
+
   async function doWarm(key: string, baseURL: string): Promise<WarmResult> {
     const cacheKey = `${baseURL}::${key}`
     warnIfNonLoopback(baseURL)
@@ -579,11 +809,37 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
         }
       }
 
+      // Make room under RAM pressure before loading (opt-in). `evicted` tracks
+      // what this attempt has already unloaded so predictive and reactive passes
+      // never double-unload the same instance.
+      const evicted = new Set<string>()
+      if (opts.evictOnPressure) await preEvict(key, evicted, touchLock)
+
       const args = loadArgs(opts, key)
-      log(`loading ${key} (${args.join(" ")}) ...`)
-      await touchLock()
       const t0 = Date.now()
-      const res = await lms(args, opts.loadTimeoutMs)
+      const res = await (async () => {
+        for (;;) {
+          log(`loading ${key} (${args.join(" ")}) ...`)
+          await touchLock()
+          const r = await lms(args, opts.loadTimeoutMs)
+          if (r.ok) return r
+          // Reactive backstop: a guardrail/OOM refusal means the model didn't
+          // fit. Free the next LRU idle instance and retry, until it loads or no
+          // idle victim remains. Timeouts and non-memory errors (bad config,
+          // missing model) fall straight through — evicting for those would
+          // needlessly unload healthy models for a load that can't succeed.
+          const detail = (r.stderr || r.stdout).trim().slice(0, 500)
+          if (opts.evictOnPressure && !r.timedOut && isMemoryPressureError(detail)) {
+            const freed = await evictNextIdle(key, evicted, touchLock)
+            if (freed) {
+              log(`lms load ${key} refused for memory (${detail.slice(0, 120)}); evicted ${freed}, retrying`)
+              continue
+            }
+            log(`lms load ${key} refused for memory but no idle instance remains to evict`)
+          }
+          return r
+        }
+      })()
       if (!res.ok) {
         const kind = res.timedOut ? "timeout" : "error"
         const detail = (res.stderr || res.stdout).trim().slice(0, 500)

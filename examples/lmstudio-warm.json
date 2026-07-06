@@ -9,6 +9,11 @@
   "loadTimeoutMs": 900000,
   "serverStartTimeoutMs": 90000,
   "lockWaitTimeoutMs": 1200000,
+  "evictOnPressure": true,
+  "ramBudgetMB": 0,
+  "evictHeadroomMB": 4096,
+  "evictProtect": [],
+  "evictMaxVictims": 8,
   "perModel": {
     "your-main-model-key": { "parallel": 6 },
     "your-small-model-key": { "parallel": 4 }

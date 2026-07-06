@@ -31,6 +31,16 @@ options in `opencode.json`). Highlights:
   model tolerates queueing; the main model is where fleet width matters.
 - **timeouts** (`loadTimeoutMs`, `serverStartTimeoutMs`, `lockWaitTimeoutMs`,
   `verifyCacheMs`, `retryCooldownMs`) are tuned for a multi-worker fleet.
+- **`evictOnPressure: true`** — opt-in RAM-pressure eviction (off by default in
+  the plugin). On a finite-RAM host with several large models, it unloads
+  **idle** instances (never busy, never the target, never a key in
+  `evictProtect`) in LRU order to make room before a load the memory guardrail
+  would otherwise refuse. `ramBudgetMB: 0` auto-sizes the budget to 90% of
+  physical memory; raise `evictHeadroomMB` if large-context loads still fail.
+  `evictMaxVictims` caps how many instances one attempt may unload (bounds
+  lock-hold time). Eviction is best-effort and not atomic — concurrent LM Studio
+  use from the UI or other clients is not protected; use `evictProtect` for
+  models that must never be touched.
 
 See the [README's Configuration section](../README.md#configuration) for the full
 option list and defaults.

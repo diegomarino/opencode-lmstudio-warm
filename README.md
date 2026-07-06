@@ -157,8 +157,51 @@ The plugin works with zero configuration. Optional tuning lives in
 | `reconcileDuplicates` | `true` | Unload idle suffixed duplicates (`key:2` …) and load fresh when the bare key isn't addressable. |
 | `launchAppFallback` | `true` | If the server won't start, try `open -ga "LM Studio"` once (macOS only). |
 | `eager` | `true` | Background-warm `model` + `small_model` at instance start. |
+| `evictOnPressure` | `false` | Opt-in RAM-pressure eviction: before loading a model that won't fit, unload **idle** instances (never busy, never the target, never protected) in LRU order to make room, then load. Off by default. See below. |
+| `ramBudgetMB` | `0` | RAM the fleet may use for LM Studio, in MB. `0` = auto (90% of total physical memory). The fit calc measures room against this — **not** `os.freemem()`, which under-reports available memory on macOS. |
+| `evictHeadroomMB` | `4096` | Flat safety margin (MB) added over a model's on-disk weight size when deciding whether it fits. Deliberately flat, not a KV-cache estimate (see note below); raise it for large `contextLength` / `parallel`. |
+| `evictProtect` | `[]` | Model keys (or instance identifiers) eviction must never unload. |
+| `evictMaxVictims` | `8` | Max instances eviction may unload per warm attempt (predictive + reactive combined). Caps worst-case lock-hold time; `0` = unlimited. |
 | `logFile` | `~/.cache/opencode/lmstudio-warm.log` | Plugin log file; rotated to `<logFile>.old` once it grows past ~5 MB. |
 | `lockDir` | `~/.cache/opencode/lmstudio-warm.lock` | Cross-process lock directory. |
+
+### RAM-pressure eviction (opt-in)
+
+On a finite-RAM host running several large models, LM Studio with
+`modelLoadingGuardrails` set high **refuses** to load a model that doesn't fit
+rather than making room — so the target never loads and the request falls back
+to JIT or errors. Enable `evictOnPressure` to have the warm gate free room
+first. When a target model isn't resident and must be loaded, the gate:
+
+1. **Predictive pass** — looks up the target's weight size (`lms ls`), and if
+   it won't fit under `ramBudgetMB` (+ `evictHeadroomMB`), unloads idle
+   instances **least-recently-used first** until it fits, then loads.
+2. **Reactive backstop** — if the load is still refused for memory (weight size
+   is not the true runtime footprint), it frees the next idle instance and
+   retries, until the load succeeds or no idle instance remains.
+
+Only **idle** instances are ever unloaded: anything generating or with queued
+work is left alone, as is the target model and any key in `evictProtect`. A
+fresh check immediately before each unload re-confirms the victim is still idle.
+Everything runs under the same cross-process lock as loading, so concurrent
+warm-gate workers don't over-commit RAM. At most `evictMaxVictims` instances are
+unloaded per attempt, bounding worst-case lock-hold time.
+
+> **Best-effort, not atomic:** the pre-unload check and the `unload` itself are
+> two separate `lms` commands, and the lock only coordinates this plugin's
+> workers — not the LM Studio UI or other `lms` clients. So concurrent external
+> use is **not** protected during eviction: a model can turn busy in the gap
+> between check and unload, and a model being loaded by another client appears
+> `idle` to `lms ps` (there is no ps-visible "loading" state). The window is
+> narrow, but if you drive LM Studio from several places at once, prefer
+> `evictProtect` for models you never want touched.
+
+> **Why `evictHeadroomMB` is a flat number:** an accurate KV-cache estimate
+> needs per-architecture internals (layers, KV heads, head dim) that `lms`
+> doesn't expose, so any formula would be a false-precision guess. The reactive
+> backstop absorbs under-prediction, so a flat margin that catches the gross
+> case is enough. If loads are still refused with large context or parallelism,
+> raise `evictHeadroomMB`.
 
 See `examples/lmstudio-warm.json` for a fleet-tuned starting point
 (`cp examples/lmstudio-warm.json ~/.config/opencode/lmstudio-warm.json`).

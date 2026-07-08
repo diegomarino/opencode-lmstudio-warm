@@ -5,17 +5,45 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only token: nothing in CI writes to the repo.
+permissions:
+  contents: read
+
 jobs:
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS is the platform the plugin is verified on; ubuntu is the cheap
+        # canary that keeps everything platform-neutral.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-      - name: Install dev dependencies
-        run: bun install
+      # Third-party actions pinned by commit SHA (tags are mutable).
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - name: Install dev dependencies (locked)
+        run: bun install --frozen-lockfile
       - name: Type-check the plugin
         run: bun run typecheck
-      - name: Run unit tests
+      - name: Run unit + integration tests
         run: bun run test
       - name: Lint verify.sh
+        if: runner.os == 'Linux' # shellcheck is preinstalled on ubuntu images
         run: shellcheck --severity=warning test/e2e/verify.sh
+
+  # semantic-release derives versions from commit messages; the husky hook only
+  # covers local commits, so re-check every PR commit here (web UI edits,
+  # --no-verify, and merge queues would otherwise slip past).
+  commitlint:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0 # commitlint walks the PR's commit range
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - name: Install dev dependencies (locked)
+        run: bun install --frozen-lockfile
+      - name: Lint PR commit messages
+        run: bunx commitlint --from ${{ github.event.pull_request.base.sha }} --to ${{ github.event.pull_request.head.sha }} --verbose

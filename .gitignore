@@ -1,6 +1,7 @@
-# Dependencies (dev-only, for type-checking the plugin against @opencode-ai/plugin)
+# Dependencies (dev-only, for type-checking the plugin against @opencode-ai/plugin).
+# bun.lock IS tracked so CI and the release workflow build with the exact
+# dependency set that was tested (bun install --frozen-lockfile).
 node_modules/
-bun.lock
 package-lock.json
 pnpm-lock.yaml
 yarn.lock

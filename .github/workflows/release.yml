@@ -31,7 +31,7 @@ jobs:
     steps:
       # Third-party actions pinned by commit SHA (tags are mutable) — this
       # workflow holds id-token: write and publishes to npm.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
         with:
           fetch-depth: 0 # semantic-release needs full history + tags
 

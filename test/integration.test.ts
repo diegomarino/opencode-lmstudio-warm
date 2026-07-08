@@ -173,6 +173,10 @@ function makeSandbox(): Sandbox {
           eager: false,
           providers: ["lmstudio"],
           failMode: "hybrid",
+          // Deterministic across platforms: on darwin the default fallback
+          // would `open -ga "LM Studio"` on the runner and retry the server
+          // start, doubling the `server start` call the tests count.
+          launchAppFallback: false,
           loadTimeoutMs: 10_000,
           serverStartTimeoutMs: 1_500,
           lockWaitTimeoutMs: 2_000,

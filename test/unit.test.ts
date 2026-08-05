@@ -3,6 +3,7 @@ import {
   resolveOptions,
   sanitizeOptions,
   unknownOptionKeys,
+  parseFileOptions,
   addressable,
   classifyPs,
   parseModelRef,
@@ -101,12 +102,68 @@ describe("sanitizeOptions", () => {
     expect(warnings[0]).toContain("evictProtect")
   })
 
+  it("rejects providers containing an empty string", () => {
+    const { opts: o, warnings } = sanitizeOptions(resolveOptions({ providers: ["lmstudio", ""] }, null))
+    expect(o.providers).toEqual(["lmstudio"])
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain("providers")
+  })
+
+  it("drops a non-object perModel entry, keeping valid siblings", () => {
+    const { opts: o, warnings } = sanitizeOptions(
+      resolveOptions({ perModel: { bad: "nope" as never, good: { parallel: 2 } } }, null),
+    )
+    expect(o.perModel).toEqual({ good: { parallel: 2 } })
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('perModel["bad"]')
+  })
+
+  it("drops invalid perModel fields (wrong type, negative) but keeps the entry's valid fields", () => {
+    const { opts: o, warnings } = sanitizeOptions(
+      resolveOptions({ perModel: { k: { parallel: "9" as never, ttlSeconds: -1, contextLength: 8192 } } }, null),
+    )
+    expect(o.perModel).toEqual({ k: { contextLength: 8192 } })
+    expect(warnings).toHaveLength(2)
+    expect(warnings.some((w) => w.includes('perModel["k"].parallel'))).toBe(true)
+    expect(warnings.some((w) => w.includes('perModel["k"].ttlSeconds'))).toBe(true)
+  })
+
+  it("warns on unknown perModel fields (a typo'd override would be silently ignored)", () => {
+    const { opts: o, warnings } = sanitizeOptions(resolveOptions({ perModel: { k: { ttl: 30 } as never } }, null))
+    expect(o.perModel).toEqual({ k: {} })
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('unknown field "ttl"')
+  })
+
   it("defaults evictMaxVictims to 8 and resets a negative value to the default", () => {
     expect(resolveOptions({}, null).evictMaxVictims).toBe(8)
     const { opts: o, warnings } = sanitizeOptions(resolveOptions({ evictMaxVictims: -3 }, null))
     expect(o.evictMaxVictims).toBe(8)
     expect(warnings).toHaveLength(1)
     expect(warnings[0]).toContain("evictMaxVictims")
+  })
+})
+
+describe("parseFileOptions", () => {
+  const SRC = "/x/lmstudio-warm.json"
+
+  it("parses a valid JSON object with no warning", () => {
+    expect(parseFileOptions('{"parallel": 2}', SRC)).toEqual({ opts: { parallel: 2 }, warning: null })
+  })
+
+  it("warns (instead of silently ignoring) on malformed JSON", () => {
+    const { opts, warning } = parseFileOptions('{"parallel": 2', SRC)
+    expect(opts).toEqual({})
+    expect(warning).toContain(SRC)
+    expect(warning).toContain("not valid JSON")
+  })
+
+  it("warns when the top level is not an object", () => {
+    for (const bad of ["[1]", '"str"', "null", "42"]) {
+      const { opts, warning } = parseFileOptions(bad, SRC)
+      expect(opts).toEqual({})
+      expect(warning).toContain("must contain a JSON object")
+    }
   })
 })
 

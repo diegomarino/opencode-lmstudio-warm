@@ -152,14 +152,15 @@ const DEFAULTS: WarmOptions = {
 const RAM_BUDGET_AUTO_FRACTION = 0.9
 const BYTES_PER_MB = 1024 * 1024
 
-function loadFileOptions(): Partial<WarmOptions> {
+function loadFileOptions(): { opts: Partial<WarmOptions>; warning: string | null } {
+  const p = path.join(HOME, ".config/opencode/lmstudio-warm.json")
+  let content: string | null = null
   try {
-    const p = path.join(HOME, ".config/opencode/lmstudio-warm.json")
-    if (!fs.existsSync(p)) return {}
-    return JSON.parse(fs.readFileSync(p, "utf8"))
+    content = fs.readFileSync(p, "utf8")
   } catch {
-    return {}
+    return { opts: {}, warning: null } // absent — the common case
   }
+  return parseFileOptions(content, p)
 }
 
 export type LmsInstance = {
@@ -195,6 +196,23 @@ export function unknownOptionKeys(raw: Record<string, unknown>): string[] {
   return Object.keys(raw).filter((k) => !(k in DEFAULTS))
 }
 
+/** Parse the contents of lmstudio-warm.json. Malformed JSON (or a non-object
+ *  top level) yields empty options PLUS a warning: silently dropping the
+ *  user's entire config file would otherwise be the one config mistake that
+ *  never surfaces in the log. */
+export function parseFileOptions(content: string, sourcePath: string): { opts: Partial<WarmOptions>; warning: string | null } {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(content)
+  } catch (err) {
+    return { opts: {}, warning: `${sourcePath} is not valid JSON (${err instanceof Error ? err.message : String(err)}) — ignoring the file` }
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { opts: {}, warning: `${sourcePath} must contain a JSON object — ignoring the file` }
+  }
+  return { opts: parsed as Partial<WarmOptions>, warning: null }
+}
+
 const NUMERIC_KEYS = [
   "ttlSeconds",
   "parallel",
@@ -223,15 +241,46 @@ export function sanitizeOptions(o: WarmOptions): { opts: WarmOptions; warnings: 
     ;(out as Record<string, unknown>)[key] = DEFAULTS[key]
   }
   if (!["open", "closed", "hybrid"].includes(out.failMode)) fix("failMode", `"${out.failMode}" is not open|closed|hybrid`)
-  if (!Array.isArray(out.providers) || out.providers.length === 0 || out.providers.some((p) => typeof p !== "string"))
-    fix("providers", "must be a non-empty string array")
+  if (!Array.isArray(out.providers) || out.providers.length === 0 || out.providers.some((p) => typeof p !== "string" || p === ""))
+    fix("providers", "must be a non-empty array of non-empty strings")
   for (const k of NUMERIC_KEYS) if (typeof out[k] !== "number" || !Number.isFinite(out[k]) || out[k] < 0) fix(k, "must be a non-negative number")
   for (const k of BOOLEAN_KEYS) if (typeof out[k] !== "boolean") fix(k, "must be a boolean")
   for (const k of STRING_KEYS) if (typeof out[k] !== "string" || out[k] === "") fix(k, "must be a non-empty string")
   if (out.perModel === null || typeof out.perModel !== "object" || Array.isArray(out.perModel)) fix("perModel", "must be an object")
+  else out.perModel = sanitizePerModel(out.perModel, warnings)
   if (!Array.isArray(out.evictProtect) || out.evictProtect.some((p) => typeof p !== "string"))
     fix("evictProtect", "must be a string array")
   return { opts: out, warnings }
+}
+
+const PER_MODEL_FIELDS = ["ttlSeconds", "parallel", "contextLength"] as const
+
+/** Validate perModel entries field by field: a non-object entry is dropped, an
+ *  invalid or unknown field inside an entry is dropped, valid fields survive.
+ *  Each drop gets its own warning — these values feed straight into `lms load`
+ *  argv, so a typo'd or wrong-typed override must not ride along silently. */
+function sanitizePerModel(perModel: Record<string, PerModel>, warnings: string[]): Record<string, PerModel> {
+  const cleaned: Record<string, PerModel> = {}
+  for (const [key, per] of Object.entries(perModel)) {
+    if (per === null || typeof per !== "object" || Array.isArray(per)) {
+      warnings.push(`perModel["${key}"] must be an object — ignoring the entry`)
+      continue
+    }
+    const entry: PerModel = {}
+    for (const [field, value] of Object.entries(per)) {
+      if (!PER_MODEL_FIELDS.includes(field as (typeof PER_MODEL_FIELDS)[number])) {
+        warnings.push(`perModel["${key}"] has unknown field "${field}" — ignoring it`)
+        continue
+      }
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+        warnings.push(`perModel["${key}"].${field} must be a non-negative number — ignoring it`)
+        continue
+      }
+      entry[field as (typeof PER_MODEL_FIELDS)[number]] = value
+    }
+    cleaned[key] = entry
+  }
+  return cleaned
 }
 
 /** opencode addresses models by the UNSUFFIXED key; LM Studio routes the API
@@ -401,9 +450,10 @@ export function shouldFailRequest(failMode: WarmOptions["failMode"], result: War
 }
 
 export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
-  const fileOpts = loadFileOptions()
+  const { opts: fileOpts, warning: fileWarning } = loadFileOptions()
   const plugOpts = (pluginOptions ?? {}) as Partial<WarmOptions>
   const { opts, warnings: configWarnings } = sanitizeOptions(resolveOptions(fileOpts, plugOpts))
+  if (fileWarning) configWarnings.push(fileWarning)
   for (const k of unknownOptionKeys(fileOpts as Record<string, unknown>))
     configWarnings.push(`unknown option "${k}" in lmstudio-warm.json`)
   for (const k of unknownOptionKeys(plugOpts as Record<string, unknown>))

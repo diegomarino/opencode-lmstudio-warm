@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.3](https://github.com/diegomarino/opencode-lmstudio-warm/compare/v0.2.2...v0.2.3) (2026-08-05)
+
+### Bug Fixes
+
+* decode UTF-16 lms output on Windows (issue [#3](https://github.com/diegomarino/opencode-lmstudio-warm/issues/3) root cause) ([7ec1f48](https://github.com/diegomarino/opencode-lmstudio-warm/commit/7ec1f4860ac520cbe5ea1d81c5a29d9435160278))
+* harden lms JSON parsing against non-array shapes (issue [#3](https://github.com/diegomarino/opencode-lmstudio-warm/issues/3)) ([7ea4ea4](https://github.com/diegomarino/opencode-lmstudio-warm/commit/7ea4ea400bbd7837f299755c0ce75a3704b4e44e))
+* harden lms JSON parsing against non-array shapes (issue [#3](https://github.com/diegomarino/opencode-lmstudio-warm/issues/3)) ([4020ae5](https://github.com/diegomarino/opencode-lmstudio-warm/commit/4020ae5a6608fa96d2c59011c77c2adb3079f4be))
+
+### Tests
+
+* adversarial integration coverage for lms output shape-drift ([ed3499f](https://github.com/diegomarino/opencode-lmstudio-warm/commit/ed3499f154cfb15ff80337d7959d9c7105d5649e))
+
 ## [0.2.2](https://github.com/diegomarino/opencode-lmstudio-warm/compare/v0.2.1...v0.2.2) (2026-08-05)
 
 ### Bug Fixes

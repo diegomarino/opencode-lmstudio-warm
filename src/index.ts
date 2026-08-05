@@ -290,14 +290,15 @@ function sanitizePerModel(perModel: Record<string, PerModel>, warnings: string[]
  *  against it until ready — there is no ps-visible "loading" state, and none is
  *  needed for correctness. */
 export function addressable(instances: LmsInstance[], key: string): boolean {
-  return instances.some((i) => i.identifier === key)
+  return Array.isArray(instances) && instances.some((i) => i?.identifier === key)
 }
 
-/** Classify `lms ps` output for a key. "unknown" (ps output unavailable) is a
- *  first-class state on purpose: it is AMBIGUOUS, never "absent" — loading
- *  blind onto a possibly-resident key is how duplicate instances are made,
- *  and a failed post-load probe must not be reported as a confirmed load
- *  failure (that would negative-cache a model that may well be loaded). */
+/** Classify `lms ps` output for a key. "unknown" (ps output unavailable OR an
+ *  unparseable/unexpected shape) is a first-class state on purpose: it is
+ *  AMBIGUOUS, never "absent" — loading blind onto a possibly-resident key is how
+ *  duplicate instances are made, and a failed post-load probe must not be
+ *  reported as a confirmed load failure (that would negative-cache a model that
+ *  may well be loaded). */
 export type PsCheck =
   | { state: "unknown" }
   | { state: "addressable" }
@@ -305,12 +306,47 @@ export type PsCheck =
   | { state: "duplicates"; dups: LmsInstance[]; busy: boolean }
 
 export function classifyPs(instances: LmsInstance[] | null, key: string): PsCheck {
-  if (instances === null) return { state: "unknown" }
+  // Any non-array — null (ps unavailable) OR an unexpected shape that slipped
+  // through parsing — degrades to "unknown": never "absent", never throwing.
+  // A non-array reaching `.some`/`.filter` here is what crashed the gate on some
+  // lms/platform combinations (issue #3).
+  if (!Array.isArray(instances)) return { state: "unknown" }
   if (addressable(instances, key)) return { state: "addressable" }
-  const dups = instances.filter((i) => i.modelKey === key)
+  const dups = instances.filter((i) => i?.modelKey === key)
   if (dups.length === 0) return { state: "absent" }
   const busy = dups.some((i) => i.status === "generating" || (i.queued ?? 0) > 0)
   return { state: "duplicates", dups, busy }
+}
+
+/** Parse `lms … --json` stdout into an array, leniently, so a shape drift
+ *  degrades to null ("unknown") rather than throwing. Handles three real-world
+ *  quirks observed across lms versions/platforms:
+ *   - a leading UTF-8 BOM (Windows `lms.exe` piped through PowerShell can prefix
+ *     one, which plain `JSON.parse` rejects) and surrounding whitespace;
+ *   - a bare top-level array (the macOS shape this was verified against);
+ *   - an object wrapping the array under one of `unwrapKeys` (e.g.
+ *     `{ "instances": [...] }`).
+ *  Anything else — a non-array primitive, an object without a wrapped array,
+ *  invalid JSON, or empty output — returns null. Callers treat null as
+ *  "output unusable → unknown", never as "absent". */
+export function parseLmsJsonArray(stdout: string, unwrapKeys: string[] = []): unknown[] | null {
+  if (typeof stdout !== "string") return null
+  const cleaned = stdout.replace(/^\uFEFF/, "").trim()
+  if (cleaned === "") return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(cleaned)
+  } catch {
+    return null
+  }
+  if (Array.isArray(parsed)) return parsed
+  if (parsed !== null && typeof parsed === "object") {
+    for (const k of unwrapKeys) {
+      const v = (parsed as Record<string, unknown>)[k]
+      if (Array.isArray(v)) return v
+    }
+  }
+  return null
 }
 
 /** Split an opencode model ref ("provider/key…") on the FIRST slash, so a key
@@ -361,6 +397,7 @@ export function parseModelSize(lsArray: Array<{ modelKey?: string; sizeBytes?: n
  *  keys/identifiers, and anything without an identifier to unload. A missing
  *  lastUsedTime sorts first (treated as oldest). */
 export function evictionCandidates(instances: LmsInstance[], targetKey: string, protect: string[]): LmsInstance[] {
+  if (!Array.isArray(instances)) return []
   return instances
     .filter(
       (i) =>
@@ -554,13 +591,9 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
       log(`lms ps failed: ${res.stderr.trim().slice(0, 300)}`)
       return null
     }
-    try {
-      const parsed = JSON.parse(res.stdout)
-      return Array.isArray(parsed) ? parsed : null
-    } catch {
-      log(`lms ps returned non-JSON: ${res.stdout.slice(0, 200)}`)
-      return null
-    }
+    const parsed = parseLmsJsonArray(res.stdout, ["instances"]) as LmsInstance[] | null
+    if (parsed === null) log(`lms ps output unusable (not a JSON array): ${res.stdout.slice(0, 200)}`)
+    return parsed
   }
 
   // "Alive" means the server is listening — any HTTP response counts, including
@@ -705,13 +738,9 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
       log(`lms ls failed: ${res.stderr.trim().slice(0, 200)}`)
       return null
     }
-    try {
-      const parsed = JSON.parse(res.stdout)
-      return Array.isArray(parsed) ? parsed : null
-    } catch {
-      log(`lms ls returned non-JSON: ${res.stdout.slice(0, 200)}`)
-      return null
-    }
+    const parsed = parseLmsJsonArray(res.stdout, ["models"]) as Array<{ modelKey?: string; sizeBytes?: number }> | null
+    if (parsed === null) log(`lms ls output unusable (not a JSON array): ${res.stdout.slice(0, 200)}`)
+    return parsed
   }
 
   // Unload one instance ONLY if a fresh ps still shows it as an eviction

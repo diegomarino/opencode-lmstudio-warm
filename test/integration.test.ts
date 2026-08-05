@@ -52,11 +52,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
   const cmd = args[0]
   if (cmd === "ps") {
     if (state.psFail) { console.error("ps failed (scripted)"); process.exit(1) }
+    // psRaw prints verbatim (no trailing newline) so a test can inject exact
+    // bytes: a leading BOM, an object wrapper, truncated/garbage JSON.
+    if (typeof state.psRaw === "string") { process.stdout.write(state.psRaw); return }
     console.log(JSON.stringify(state.instances))
     return
   }
   if (cmd === "ls") {
     if (state.lsFail) { console.error("ls failed (scripted)"); process.exit(1) }
+    if (typeof state.lsRaw === "string") { process.stdout.write(state.lsRaw); return }
     console.log(JSON.stringify(state.downloaded ?? []))
     return
   }
@@ -97,6 +101,10 @@ type FakeState = {
   load?: Record<string, LoadBehavior>
   psFail?: boolean
   lsFail?: boolean
+  /** Verbatim stdout for `ps` / `ls`, overriding the JSON.stringify default —
+   *  used to inject shape-drift (BOM, wrapper object, non-array, garbage). */
+  psRaw?: string
+  lsRaw?: string
 }
 
 type Sandbox = {
@@ -504,5 +512,106 @@ describe("eager warm", () => {
     await lazy["config"]({ model: "lmstudio/k" })
     await new Promise((r) => setTimeout(r, 300))
     expect(sb.calls().length).toBe(0)
+  })
+})
+
+// ─── Adversarial: lms output shape-drift (issue #3) ──────────────────────────
+// The fake's psRaw/lsRaw inject exact stdout the JSON.stringify default cannot:
+// a leading BOM, an object wrapper, a non-array, garbage. These drive the REAL
+// psInstances → parseLmsJsonArray → classifyPs path end-to-end. (Scenario A of
+// docs/superpowers/specs/2026-08-05-adversarial-integration-tests-design.md.)
+
+describe("lms output shape-drift", () => {
+  const resident = [{ modelKey: "k", identifier: "k", status: "idle", queued: 0 }]
+
+  // failMode "closed" is the distinguisher: a recognized (addressable) model
+  // passes, but an "unknown" verdict throws. So `resolves` proves the drifted
+  // shape was actually parsed into the resident model \u2014 not merely tolerated as
+  // unknown (which would fail-open under hybrid and pass vacuously).
+  it("ps with a leading UTF-8 BOM: the resident model is recognized (closed mode passes), no load", async () => {
+    const sb = makeSandbox()
+    sb.setState({ instances: [], psRaw: "\uFEFF" + JSON.stringify(resident) })
+    const hooks = await sb.plugin({ failMode: "closed" })
+    await expect(hooks["chat.params"](sb.chatInput("k"))).resolves.toBeUndefined()
+    expect(sb.loads("k")).toBe(0)
+  })
+
+  it("ps as a { instances: [...] } wrapper object: unwrapped and recognized (closed mode passes), no load", async () => {
+    const sb = makeSandbox()
+    sb.setState({ instances: [], psRaw: JSON.stringify({ instances: resident }) })
+    const hooks = await sb.plugin({ failMode: "closed" })
+    await expect(hooks["chat.params"](sb.chatInput("k"))).resolves.toBeUndefined()
+    expect(sb.loads("k")).toBe(0)
+  })
+
+  it("ps as a non-array object, garbage, or truncated JSON: unknown → hybrid fail-open, never a blind load", async () => {
+    for (const raw of ['{"foo":1}', "not json at all", '[{"identifier":"k"']) {
+      const sb = makeSandbox()
+      sb.setState({ instances: [], psRaw: raw })
+      const hooks = await sb.plugin({ failMode: "hybrid" })
+      await expect(hooks["chat.params"](sb.chatInput("k"))).resolves.toBeUndefined()
+      expect(sb.loads("k")).toBe(0)
+    }
+  })
+
+  it("ls as a { models: [...] } wrapper: parseModelSize still finds the target, predictive eviction runs", async () => {
+    const sb = makeSandbox()
+    sb.setState({
+      instances: [{ modelKey: "old", identifier: "old", status: "idle", queued: 0, sizeBytes: 800 * MB, lastUsedTime: 1_000 }],
+      lsRaw: JSON.stringify({ models: [{ modelKey: "k", sizeBytes: 500 * MB }] }),
+    })
+    // budget 1000MB, used 800 → available 200 < needed 500 + 1 headroom, so the
+    // predictive pass must read the target size FROM THE WRAPPER and evict "old".
+    const hooks = await sb.plugin({ evictOnPressure: true, ramBudgetMB: 1_000, evictHeadroomMB: 1 })
+    await hooks["chat.params"](sb.chatInput("k"))
+    expect(sb.unloads()).toEqual(["old"])
+    expect(sb.loads("k")).toBe(1)
+  })
+})
+
+// ─── Adversarial: mid-session eviction healing (TTL) ─────────────────────────
+// The headline promise — a model dropped between two requests is reloaded on the
+// next one — proven through the gate. (Scenario B.)
+
+describe("mid-session eviction healing", () => {
+  it("a model unloaded between two gate calls is reloaded on the next request", async () => {
+    const sb = makeSandbox()
+    const hooks = await sb.plugin({ verifyCacheMs: 0 }) // re-check ps every request
+    await hooks["chat.params"](sb.chatInput("k"))
+    expect(sb.loads("k")).toBe(1)
+    expect(sb.getState().instances.map((i) => i.identifier)).toEqual(["k"])
+    // Simulate LM Studio unloading it on idle TTL between requests.
+    sb.setState({ ...sb.getState(), instances: [] })
+    await hooks["chat.params"](sb.chatInput("k"))
+    expect(sb.loads("k")).toBe(2) // healed
+    expect(sb.getState().instances.map((i) => i.identifier)).toEqual(["k"])
+  })
+})
+
+// ─── Adversarial: concurrency ────────────────────────────────────────────────
+// (Scenario C. The cross-process lock serializes warms, so a concurrent-eviction
+// case adds no coverage beyond the per-attempt evictMaxVictims cap already tested
+// — omitted deliberately in favor of these two deterministic cases.)
+
+describe("concurrency under stress", () => {
+  it("N concurrent requests against a drifted (unknown) ps: all fail-open, no crash, no blind load", async () => {
+    const sb = makeSandbox()
+    sb.setState({ instances: [], psRaw: '{"unexpected":"shape"}' })
+    const hooks = await sb.plugin({ failMode: "hybrid" })
+    const results = await Promise.allSettled(
+      Array.from({ length: 5 }, () => hooks["chat.params"](sb.chatInput("k"))),
+    )
+    expect(results.every((r) => r.status === "fulfilled")).toBe(true)
+    expect(sb.loads("k")).toBe(0)
+  })
+
+  it("two different cold keys requested concurrently: each loads exactly once, serialized by the lock", async () => {
+    const sb = makeSandbox()
+    sb.setState({ instances: [], load: { a: { delayMs: 100 }, b: { delayMs: 100 } } })
+    const hooks = await sb.plugin()
+    await Promise.all([hooks["chat.params"](sb.chatInput("a")), hooks["chat.params"](sb.chatInput("b"))])
+    expect(sb.loads("a")).toBe(1)
+    expect(sb.loads("b")).toBe(1)
+    expect(sb.getState().instances.map((i) => i.identifier).sort()).toEqual(["a", "b"])
   })
 })

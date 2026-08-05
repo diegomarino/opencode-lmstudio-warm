@@ -47,6 +47,13 @@ const write = (s) => fs.writeFileSync(stateFile, JSON.stringify(s, null, 2))
 const args = process.argv.slice(2)
 fs.appendFileSync(path.join(__dirname, "calls.log"), JSON.stringify(args) + "\\n")
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+// Emit stdout in the requested encoding, prepending a BOM for UTF-16 to mirror
+// what Windows lms.exe produces through PowerShell (issue #3).
+const writeOut = (s, enc) => {
+  if (enc === "utf16le") return process.stdout.write(Buffer.from("\\uFEFF" + s, "utf16le"))
+  if (enc === "utf16be") { const b = Buffer.from("\\uFEFF" + s, "utf16le"); b.swap16(); return process.stdout.write(b) }
+  process.stdout.write(s)
+}
 ;(async () => {
   const state = read()
   const cmd = args[0]
@@ -54,13 +61,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
     if (state.psFail) { console.error("ps failed (scripted)"); process.exit(1) }
     // psRaw prints verbatim (no trailing newline) so a test can inject exact
     // bytes: a leading BOM, an object wrapper, truncated/garbage JSON.
-    if (typeof state.psRaw === "string") { process.stdout.write(state.psRaw); return }
+    if (typeof state.psRaw === "string") { writeOut(state.psRaw, state.psEncoding); return }
     console.log(JSON.stringify(state.instances))
     return
   }
   if (cmd === "ls") {
     if (state.lsFail) { console.error("ls failed (scripted)"); process.exit(1) }
-    if (typeof state.lsRaw === "string") { process.stdout.write(state.lsRaw); return }
+    if (typeof state.lsRaw === "string") { writeOut(state.lsRaw, state.lsEncoding); return }
     console.log(JSON.stringify(state.downloaded ?? []))
     return
   }
@@ -105,6 +112,10 @@ type FakeState = {
    *  used to inject shape-drift (BOM, wrapper object, non-array, garbage). */
   psRaw?: string
   lsRaw?: string
+  /** Encoding for psRaw/lsRaw; "utf16le"/"utf16be" prepend a BOM, mirroring
+   *  Windows lms.exe through PowerShell. Default (undefined) writes UTF-8. */
+  psEncoding?: "utf16le" | "utf16be"
+  lsEncoding?: "utf16le" | "utf16be"
 }
 
 type Sandbox = {
@@ -562,6 +573,57 @@ describe("lms output shape-drift", () => {
     })
     // budget 1000MB, used 800 → available 200 < needed 500 + 1 headroom, so the
     // predictive pass must read the target size FROM THE WRAPPER and evict "old".
+    const hooks = await sb.plugin({ evictOnPressure: true, ramBudgetMB: 1_000, evictHeadroomMB: 1 })
+    await hooks["chat.params"](sb.chatInput("k"))
+    expect(sb.unloads()).toEqual(["old"])
+    expect(sb.loads("k")).toBe(1)
+  })
+})
+
+// ─── Adversarial: Windows UTF-16 lms output (issue #3 root cause) ────────────
+// Windows lms.exe through PowerShell emits UTF-16LE (BOM ff fe); decoded as
+// UTF-8 it is NUL-laden mojibake no JSON.parse can read. decodeProcessOutput
+// must detect the BOM and decode, so the gate works on Windows — not merely
+// avoid crashing. These fail against a src without that decode step.
+
+describe("Windows UTF-16 lms output", () => {
+  const resident = [{ modelKey: "k", identifier: "k", status: "idle", queued: 0 }]
+
+  it("ps as UTF-16LE with a resident model: decoded and recognized (closed mode passes), no load", async () => {
+    const sb = makeSandbox()
+    sb.setState({ instances: [], psRaw: JSON.stringify(resident), psEncoding: "utf16le" })
+    const hooks = await sb.plugin({ failMode: "closed" })
+    await expect(hooks["chat.params"](sb.chatInput("k"))).resolves.toBeUndefined()
+    expect(sb.loads("k")).toBe(0)
+  })
+
+  it("ps as UTF-16LE empty []: decoded as absent → a load is attempted (not read as unknown)", async () => {
+    const sb = makeSandbox()
+    sb.setState({ instances: [], psRaw: "[]", psEncoding: "utf16le" })
+    // psRaw is a fixed override, so the post-load ps still reads [] — open mode
+    // keeps that verification artifact from throwing. The point is only that the
+    // empty UTF-16 output decoded as ABSENT (triggering the load), not "unknown"
+    // (which returns before any load). Without the decode step, loads would be 0.
+    const hooks = await sb.plugin({ failMode: "open" })
+    await expect(hooks["chat.params"](sb.chatInput("k"))).resolves.toBeUndefined()
+    expect(sb.loads("k")).toBe(1)
+  })
+
+  it("ps as UTF-16BE (BOM fe ff): also decoded and recognized (closed mode passes)", async () => {
+    const sb = makeSandbox()
+    sb.setState({ instances: [], psRaw: JSON.stringify(resident), psEncoding: "utf16be" })
+    const hooks = await sb.plugin({ failMode: "closed" })
+    await expect(hooks["chat.params"](sb.chatInput("k"))).resolves.toBeUndefined()
+    expect(sb.loads("k")).toBe(0)
+  })
+
+  it("ls as UTF-16LE under eviction: the target size is decoded, predictive eviction runs", async () => {
+    const sb = makeSandbox()
+    sb.setState({
+      instances: [{ modelKey: "old", identifier: "old", status: "idle", queued: 0, sizeBytes: 800 * MB, lastUsedTime: 1_000 }],
+      lsRaw: JSON.stringify({ models: [{ modelKey: "k", sizeBytes: 500 * MB }] }),
+      lsEncoding: "utf16le",
+    })
     const hooks = await sb.plugin({ evictOnPressure: true, ramBudgetMB: 1_000, evictHeadroomMB: 1 })
     await hooks["chat.params"](sb.chatInput("k"))
     expect(sb.unloads()).toEqual(["old"])

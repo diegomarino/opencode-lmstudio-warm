@@ -37,7 +37,7 @@
  * the plugin closure composes them with the live state and child processes.
  */
 import type { Plugin } from "@opencode-ai/plugin"
-import { execFile } from "node:child_process"
+import { execFile, type ExecFileOptionsWithBufferEncoding } from "node:child_process"
 import * as fs from "node:fs"
 import * as fsp from "node:fs/promises"
 import * as os from "node:os"
@@ -349,6 +349,25 @@ export function parseLmsJsonArray(stdout: string, unwrapKeys: string[] = []): un
   return null
 }
 
+/** Decode a child process's stdout/stderr bytes honoring a leading byte-order
+ *  mark. Windows `lms.exe` piped through PowerShell emits UTF-16LE (BOM
+ *  0xFF 0xFE); decoded as UTF-8 it becomes NUL-laden mojibake no JSON.parse can
+ *  read — the real root cause of issue #3 on Windows. Detect the BOM and decode
+ *  accordingly (UTF-16LE, UTF-16BE via a byte-swapped copy, else UTF-8). Any
+ *  residual U+FEFF is stripped downstream: parseLmsJsonArray for JSON output,
+ *  String.trim for logged error text. A string input (encoding-less execFile
+ *  fallback) is returned unchanged. */
+export function decodeProcessOutput(out: Buffer | string): string {
+  if (typeof out === "string") return out
+  if (out.length >= 2 && out[0] === 0xff && out[1] === 0xfe) return out.toString("utf16le")
+  if (out.length >= 2 && out[0] === 0xfe && out[1] === 0xff && out.length % 2 === 0) {
+    const swapped = Buffer.from(out)
+    swapped.swap16()
+    return swapped.toString("utf16le")
+  }
+  return out.toString("utf8")
+}
+
 /** Split an opencode model ref ("provider/key…") on the FIRST slash, so a key
  *  that itself contains slashes (e.g. "qwen/qwen3") is preserved intact. */
 export function parseModelRef(ref: unknown): { providerID: string; key: string } | null {
@@ -571,13 +590,21 @@ export const LMStudioWarm: Plugin = async (_input, pluginOptions) => {
     args: string[],
     timeoutMs: number,
   ): Promise<{ ok: boolean; timedOut: boolean; stdout: string; stderr: string }> {
+    // encoding: "buffer" so a Windows `lms.exe` that emits UTF-16LE (via
+    // PowerShell) is decoded by BOM, not mangled as UTF-8 (issue #3).
+    const execOpts: ExecFileOptionsWithBufferEncoding = {
+      timeout: timeoutMs,
+      maxBuffer: 16 * 1024 * 1024,
+      env: process.env,
+      encoding: "buffer",
+    }
     return new Promise((resolve) => {
-      execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, env: process.env }, (err, stdout, stderr) =>
+      execFile(cmd, args, execOpts, (err, stdout, stderr) =>
         resolve({
           ok: !err,
           timedOut: Boolean(err && (err as any).killed),
-          stdout: String(stdout),
-          stderr: String(stderr),
+          stdout: decodeProcessOutput(stdout),
+          stderr: decodeProcessOutput(stderr),
         }),
       )
     })

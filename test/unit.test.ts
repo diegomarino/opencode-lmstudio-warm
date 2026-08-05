@@ -6,6 +6,8 @@ import {
   parseFileOptions,
   addressable,
   classifyPs,
+  parseLmsJsonArray,
+  decodeProcessOutput,
   parseModelRef,
   loadArgs,
   pidAlive,
@@ -181,6 +183,17 @@ describe("addressable", () => {
   it("false on an empty instance list", () => {
     expect(addressable([], "qwen/q3")).toBe(false)
   })
+
+  it("returns false (never throws) when handed a non-array (defensive; issue #3)", () => {
+    expect(addressable({ instances: [] } as never, "k")).toBe(false)
+    expect(addressable(null as never, "k")).toBe(false)
+    expect(addressable(undefined as never, "k")).toBe(false)
+  })
+
+  it("tolerates null/garbage elements without throwing", () => {
+    expect(addressable([null as never, { identifier: "k" }], "k")).toBe(true)
+    expect(addressable([null as never, undefined as never], "k")).toBe(false)
+  })
 })
 
 describe("classifyPs", () => {
@@ -216,6 +229,72 @@ describe("classifyPs", () => {
   it("marks duplicates busy when one has queued requests", () => {
     const dup = inst("k:2", "k", { queued: 3 })
     expect(classifyPs([dup], "k")).toEqual({ state: "duplicates", dups: [dup], busy: true })
+  })
+
+  it("degrades a non-array shape to unknown instead of throwing (issue #3)", () => {
+    // A non-array reaching classifyPs used to crash at `instances.some(...)`.
+    expect(classifyPs({ instances: [inst("k")] } as never, "k")).toEqual({ state: "unknown" })
+    expect(classifyPs({} as never, "k")).toEqual({ state: "unknown" })
+    expect(classifyPs("[]" as never, "k")).toEqual({ state: "unknown" })
+  })
+})
+
+describe("parseLmsJsonArray", () => {
+  it("parses a bare top-level array (the macOS shape)", () => {
+    expect(parseLmsJsonArray('[{"identifier":"k","modelKey":"k"}]')).toEqual([{ identifier: "k", modelKey: "k" }])
+    expect(parseLmsJsonArray("[]")).toEqual([])
+  })
+
+  it("strips a leading UTF-8 BOM before parsing (Windows lms.exe via PowerShell)", () => {
+    expect(parseLmsJsonArray('\uFEFF[{"identifier":"k"}]')).toEqual([{ identifier: "k" }])
+  })
+
+  it("tolerates surrounding whitespace / CRLF", () => {
+    expect(parseLmsJsonArray('  \r\n[{"identifier":"k"}]\n')).toEqual([{ identifier: "k" }])
+  })
+
+  it("unwraps an object shape under a requested key (shape drift across lms versions)", () => {
+    expect(parseLmsJsonArray('{"instances":[{"identifier":"k"}]}', ["instances"])).toEqual([{ identifier: "k" }])
+    // wrapper key not requested → null (caller treats as unknown, not absent)
+    expect(parseLmsJsonArray('{"instances":[{"identifier":"k"}]}')).toBeNull()
+  })
+
+  it("returns null for objects without a wrapped array, primitives, invalid JSON, or empty output", () => {
+    expect(parseLmsJsonArray('{"foo":1}', ["instances"])).toBeNull()
+    expect(parseLmsJsonArray("42")).toBeNull()
+    expect(parseLmsJsonArray('"hi"')).toBeNull()
+    expect(parseLmsJsonArray("null")).toBeNull()
+    expect(parseLmsJsonArray("not json at all")).toBeNull()
+    expect(parseLmsJsonArray("")).toBeNull()
+    expect(parseLmsJsonArray("   ")).toBeNull()
+  })
+})
+
+describe("decodeProcessOutput", () => {
+  it("returns a string input unchanged (encoding-less execFile fallback)", () => {
+    expect(decodeProcessOutput("[]")).toBe("[]")
+  })
+
+  it("decodes UTF-16LE (BOM ff fe) — the Windows PowerShell shape (issue #3)", () => {
+    const buf = Buffer.from('\uFEFF[{"identifier":"k"}]', "utf16le")
+    expect([buf[0], buf[1]]).toEqual([0xff, 0xfe]) // sanity: this really is a UTF-16LE BOM
+    expect(decodeProcessOutput(buf)).toBe('\uFEFF[{"identifier":"k"}]')
+  })
+
+  it("decodes UTF-16BE (BOM fe ff) via a byte-swapped copy", () => {
+    const be = Buffer.from("\uFEFF[]", "utf16le")
+    be.swap16() // → big-endian
+    expect([be[0], be[1]]).toEqual([0xfe, 0xff])
+    expect(decodeProcessOutput(be)).toBe("\uFEFF[]")
+  })
+
+  it("decodes plain UTF-8 (no BOM) unchanged", () => {
+    expect(decodeProcessOutput(Buffer.from('[{"identifier":"k"}]', "utf8"))).toBe('[{"identifier":"k"}]')
+  })
+
+  it("chains into parseLmsJsonArray: UTF-16LE bytes → decoded → BOM stripped → parsed array", () => {
+    const buf = Buffer.from('\uFEFF[{"identifier":"k","modelKey":"k"}]', "utf16le")
+    expect(parseLmsJsonArray(decodeProcessOutput(buf))).toEqual([{ identifier: "k", modelKey: "k" }])
   })
 })
 

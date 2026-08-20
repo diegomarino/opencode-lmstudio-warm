@@ -1,3 +1,11 @@
+> [!IMPORTANT]
+> **This repo has moved.** Development continues in the
+> [lm-studio-warm monorepo](https://github.com/diegomarino/lm-studio-warm)
+> (package [`packages/opencode`](https://github.com/diegomarino/lm-studio-warm/tree/main/packages/opencode)).
+> The npm package name is unchanged — `opencode-lmstudio-warm` — and new
+> versions are published from there with provenance. This repository is
+> archived and frozen at the last standalone release.
+
 # opencode-lmstudio-warm
 
 Deterministic, dependency-free model pre-warm for **opencode + LM Studio**.
@@ -428,3 +436,4 @@ compatibility.
 ## License
 
 [MIT](./LICENSE) © Diego Marino
+
